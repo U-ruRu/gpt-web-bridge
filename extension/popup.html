@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Web Bridge</title>
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: "Segoe UI", sans-serif;
+            background: #f4f6f8;
+            color: #16202a;
+        }
+
+        body {
+            margin: 0;
+            min-width: 320px;
+            background: #f4f6f8;
+        }
+
+        main {
+            padding: 16px;
+            display: grid;
+            gap: 12px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 18px;
+        }
+
+        p {
+            margin: 0;
+            color: #44505c;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .actions {
+            display: grid;
+            gap: 10px;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px 14px;
+            border: 0;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .primary {
+            background: #0f766e;
+            color: #ffffff;
+        }
+
+        .secondary {
+            background: #e2e8f0;
+            color: #16202a;
+        }
+
+        #status {
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: #eef2f7;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+<main>
+    <h1>ChatGPT Web Bridge</h1>
+    <p>Open the working ChatGPT tab or jump directly to the extension settings.</p>
+    <div class="actions">
+        <button id="open-chat" class="primary" type="button">Open Chat Tab</button>
+        <button id="open-settings" class="secondary" type="button">Open Settings</button>
+    </div>
+    <div id="status">Loading...</div>
+</main>
+<script src="popup.js"></script>
+</body>
+</html>

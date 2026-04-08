@@ -12,6 +12,8 @@
     "start": "node dist/index.js --transport=bridge",
     "start:bridge": "node dist/index.js --transport=bridge",
     "start:mcp": "node dist/index.js --transport=stdio",
+    "start:remote": "node dist/index.js --transport=remote",
+    "start:server": "node dist/index.js --transport=remote",
     "build:addon:unsigned": "powershell -ExecutionPolicy Bypass -File scripts/build-unsigned-addon.ps1",
     "install:firefox-host": "npm run build && powershell -ExecutionPolicy Bypass -File scripts/install-firefox-native-host.ps1",
     "install:waterfox-dev": "npm run build && powershell -ExecutionPolicy Bypass -File scripts/install-waterfox-dev-addon.ps1",
@@ -22,10 +24,12 @@
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.9.2"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.20.0",
     "zod": "^3.25.76"
   }
 }

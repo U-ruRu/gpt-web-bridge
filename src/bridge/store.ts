@@ -259,6 +259,17 @@ export class ChatGptWebRuntime {
         };
     }
 
+    async prepareFreshChatLaunch(): Promise<AutomationLaunchRecord> {
+        this.resetForFreshChat();
+        const launch = this.createAutomationLaunch(false);
+        await this.persistSessionState();
+        await this.writeLog("debug", "runtime", "Prepared a remote fresh chat launch.", {
+            sessionId: this.sessionIdValue,
+            launchToken: launch.token
+        });
+        return { ...launch };
+    }
+
     async prepareRestoreLaunch(bridgePort: number): Promise<PreparedLaunch | null> {
         const conversationUrl = this.session.conversationUrl;
         if (!conversationUrl) {

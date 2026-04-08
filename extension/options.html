@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Web Bridge Agent Settings</title>
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: "Segoe UI", sans-serif;
+            background: #f4f6f8;
+            color: #16202a;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+        }
+
+        main {
+            max-width: 760px;
+            margin: 0 auto;
+            padding: 24px;
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 28px;
+        }
+
+        p {
+            color: #44505c;
+        }
+
+        form {
+            display: grid;
+            gap: 16px;
+            margin-top: 24px;
+        }
+
+        label {
+            display: grid;
+            gap: 8px;
+            font-weight: 600;
+        }
+
+        input,
+        select {
+            border: 1px solid #c7d0d8;
+            border-radius: 10px;
+            padding: 12px 14px;
+            font-size: 14px;
+        }
+
+        button {
+            width: fit-content;
+            padding: 12px 18px;
+            border: 0;
+            border-radius: 10px;
+            background: #0f766e;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        #status {
+            margin-top: 20px;
+            padding: 14px 16px;
+            border-radius: 12px;
+            background: #eef2f7;
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+<main>
+    <h1>Browser Agent Settings</h1>
+    <p>Configure the remote server URL, the server access token, and the shared user token that binds this browser agent to your MCP clients.</p>
+    <form id="settings-form">
+        <label>
+            Server URL
+            <input id="server-url" name="server-url" placeholder="http://127.0.0.1:8787" required>
+        </label>
+        <label>
+            Server Access Token
+            <input id="server-access-token" name="server-access-token" placeholder="server access token" required>
+        </label>
+        <label>
+            User Token
+            <input id="user-token" name="user-token" placeholder="shared user token" required>
+        </label>
+        <label>
+            Parallel Chats
+            <select id="parallel-chats-mode" name="parallel-chats-mode">
+                <option value="parallel">Allowed: send requests to different chats immediately.</option>
+                <option value="sequential">Sequential: send the next chat only after the previous prompt is sent.</option>
+                <option value="sequential_safe_timeout" selected>Sequential + safe timeout: add a random 3-10 second pause before the next chat.</option>
+            </select>
+        </label>
+        <button type="submit">Save Configuration</button>
+    </form>
+    <div id="status">Loading...</div>
+</main>
+<script src="options.js"></script>
+</body>
+</html>
