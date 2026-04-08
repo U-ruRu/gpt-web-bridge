@@ -36,10 +36,12 @@ chatgpt.com
 
 - [Установка](./docs/INSTALL.md)
 - [Использование](./docs/USAGE.md)
+- [System Prompt для клиента](./docs/system_prompt.md)
 
 `README` — только обзор приложения.
 Пошаговая установка, настройка расширения и подключение MCP-клиента вынесены в [INSTALL.md](./docs/INSTALL.md).
 Рабочая модель, tool'ы, batch-операции, статусы чатов и примеры использования вынесены в [USAGE.md](./docs/USAGE.md).
+Базовый `system prompt` для клиента, который использует `chatgpt_web.*`, вынесен в [system_prompt.md](./docs/system_prompt.md).
 
 ## Токены и изоляция
 
