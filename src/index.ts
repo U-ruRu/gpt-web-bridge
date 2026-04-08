@@ -3,8 +3,9 @@ import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "./bridge/types.js";
 import { ChatGptWebRuntime } from "./bridge/store.js";
 import { listenBridgeServer, openExternalUrl, startBridgeServer } from "./bridge/server.js";
 import { startStdioMcpServer } from "./mcp/server.js";
+import { listenRemoteServer, startRemoteServer } from "./remote/server.js";
 
-type TransportMode = "bridge" | "stdio";
+type TransportMode = "bridge" | "stdio" | "remote" | "server";
 
 interface CliOptions {
     transport: TransportMode;
@@ -12,12 +13,33 @@ interface CliOptions {
     port: number;
     sessionId: string;
     dataDir?: string;
+    serverAccessToken: string;
 }
 
 void main();
 
 async function main() {
     const options = parseCliOptions(process.argv.slice(2));
+    if (options.transport === "remote" || options.transport === "server") {
+        const remoteServerHandle = startRemoteServer({
+            host: options.host,
+            port: options.port,
+            serverAccessToken: options.serverAccessToken
+        });
+        const remoteAddress = await listenRemoteServer(remoteServerHandle.server, {
+            host: options.host,
+            port: options.port
+        });
+
+        try {
+            console.error(`[server] Listening on ${remoteAddress.baseUrl}`);
+            await waitForProcessExit();
+        } finally {
+            await remoteServerHandle.close();
+        }
+        return;
+    }
+
     const runtime = new ChatGptWebRuntime({
         sessionId: options.sessionId,
         dataRootDir: options.dataDir
@@ -96,13 +118,18 @@ function parseCliOptions(args: string[]): CliOptions {
         process.env.CHATGPT_WEB_BRIDGE_SESSION_ID ||
         (transport === "stdio" ? randomUUID() : "api");
     const dataDir = options.get("data-dir") || process.env.CHATGPT_WEB_BRIDGE_DATA_DIR || undefined;
+    const serverAccessToken =
+        options.get("server-access-token") ||
+        process.env.CHATGPT_WEB_BRIDGE_SERVER_ACCESS_TOKEN ||
+        "dev-server-access-token";
 
     return {
         transport,
         host,
         port,
         sessionId,
-        dataDir
+        dataDir,
+        serverAccessToken
     };
 }
 
@@ -113,6 +140,10 @@ function parseTransportMode(rawValue: string | undefined): TransportMode {
 
     if (rawValue === "stdio") {
         return "stdio";
+    }
+
+    if (rawValue === "remote" || rawValue === "server") {
+        return "remote";
     }
 
     throw new Error(`Unsupported transport mode: ${rawValue}`);

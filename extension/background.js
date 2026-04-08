@@ -1,45 +1,52 @@
 const CHATGPT_HOME_URL = "https://chatgpt.com/";
+const AGENT_CONFIG_KEY = "agentConfig";
 const AUTOMATION_TABS_KEY = "automationTabs";
 const LAST_AUTOMATION_TAB_ID_KEY = "lastAutomationTabId";
 const DEBUG_LOGS_KEY = "debugLogs";
 const DEBUG_LOG_LIMIT = 200;
-const BRIDGE_CLAIM_QUERY_PARAM = "bridgeClaim";
-const BRIDGE_PORT_QUERY_PARAM = "bridgePort";
-const BRIDGE_SESSION_QUERY_PARAM = "bridgeSessionId";
-const BRIDGE_TEMPORARY_QUERY_PARAM = "bridgeTemporary";
-const NATIVE_HOST_NAME = "chatgpt_web_bridge_host";
-const DEFAULT_NATIVE_BRIDGE_HOST = "127.0.0.1";
-const DEFAULT_NATIVE_BRIDGE_PORT = 4545;
-const DEFAULT_NATIVE_BRIDGE_SESSION_ID = "api";
-const NATIVE_BRIDGE_READY_TIMEOUT_MS = 15000;
+const RECONNECT_DELAY_MS = 3000;
 
-let nativeHostPort = null;
-let nativeHostConnectPromise = null;
-let nativeBridgeState = {
+let agentSocket = null;
+let reconnectTimer = null;
+let connectionAttemptId = 0;
+let agentConnectionState = {
     status: "idle",
-    baseUrl: null,
-    sessionId: null,
     detail: null,
-    pid: null,
-    source: "none",
-    connected: false,
-    lastError: null
+    serverUrl: null,
+    agentId: null,
+    userId: null,
+    connected: false
 };
 
+const pendingLaunches = new Map();
+const pendingJobs = new Map();
+const pendingCommands = new Map();
+
 browser.action.onClicked.addListener(async () => {
-    await appendDebugLog("background", "info", "Browser action clicked.", {});
-    await ensureNativeBridgeHost("browser-action");
-    await ensureAutomationTab();
+    const config = await getAgentConfig();
+    if (!config) {
+        await browser.runtime.openOptionsPage();
+        return;
+    }
+
+    await connectAgentIfConfigured("browser-action");
+    const focused = await focusLastAutomationTab();
+    if (!focused) {
+        await browser.tabs.create({
+            url: CHATGPT_HOME_URL,
+            active: true
+        });
+    }
 });
 
 browser.runtime.onInstalled.addListener(async () => {
     await browser.storage.local.remove([AUTOMATION_TABS_KEY, LAST_AUTOMATION_TAB_ID_KEY, DEBUG_LOGS_KEY]);
-    logBackground("info", "Extension installed and automation state cleared.", {});
-    await ensureNativeBridgeHost("onInstalled");
+    await appendDebugLog("background", "info", "Extension installed and automation state cleared.", {});
+    await connectAgentIfConfigured("onInstalled");
 });
 
 browser.runtime.onStartup.addListener(async () => {
-    await ensureNativeBridgeHost("onStartup");
+    await connectAgentIfConfigured("onStartup");
 });
 
 browser.tabs.onRemoved.addListener(async (tabId) => {
@@ -47,80 +54,53 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
     await removeAutomationTab(tabId);
 });
 
-browser.tabs.onCreated.addListener(async (tab) => {
-    await appendDebugLog("background", "info", "Tab created.", {
-        tabId: tab.id || null,
-        url: tab.url || null
-    });
-});
-
-browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-    const nextUrl = typeof changeInfo.url === "string" ? changeInfo.url : tab.url;
-    if (!nextUrl || !nextUrl.startsWith("https://chatgpt.com/")) {
-        return;
-    }
-
-    const launchContext = parseLaunchContext(nextUrl);
-    await appendDebugLog("background", launchContext ? "info" : "debug", "Observed ChatGPT tab update.", {
-        tabId,
-        status: normalizeNullableString(changeInfo.status),
-        nextUrl,
-        hasLaunchContext: Boolean(launchContext),
-        bridgeBaseUrl: launchContext?.bridgeBaseUrl || null,
-        sessionId: launchContext?.sessionId || null,
-        isTemporary: launchContext?.isTemporary || false
-    });
-
-    if (!launchContext) {
-        return;
-    }
-
-    const existingMetadata = await getAutomationTabMetadata(tabId);
-    const launchPending = resolveLaunchPending(existingMetadata, launchContext);
-    await setAutomationTabMetadata(tabId, {
-        ...(existingMetadata || {}),
-        ...launchContext,
-        launchPending
-    });
-    logBackground(launchPending ? "info" : "debug", "Stored launch context for tab.", {
-        tabId,
-        bridgeBaseUrl: launchContext.bridgeBaseUrl,
-        sessionId: launchContext.sessionId,
-        isTemporary: launchContext.isTemporary,
-        launchPending
-    });
-    await emitBridgeLog(launchContext.bridgeBaseUrl, "background", "info", "Stored launch context for tab.", {
-        tabId,
-        sessionId: launchContext.sessionId,
-        isTemporary: launchContext.isTemporary,
-        nextUrl,
-        launchPending
-    });
-});
-
 browser.runtime.onMessage.addListener((message, sender) => {
+    if (message?.type === "saveAgentConfig") {
+        return saveAgentConfig(message.config || {});
+    }
+
+    if (message?.type === "loadAgentConfig") {
+        return getAgentConfig();
+    }
+
+    if (message?.type === "getAgentStatus") {
+        return getAgentStatus();
+    }
+
     if (message?.type === "isAutomationTab") {
         return isSenderAutomationTab(sender);
     }
 
-    if (message?.type === "isActiveTab") {
-        return isSenderActiveTab(sender);
-    }
-
-    if (message?.type === "getBridgeContext") {
-        return getBridgeContext(sender);
+    if (message?.type === "getAutomationContext") {
+        return getAutomationContext(sender);
     }
 
     if (message?.type === "claimAutomationTab") {
-        return claimAutomationTab(sender, message);
+        return claimAutomationTab(sender);
     }
 
-    if (message?.type === "ensureAutomationTab") {
-        return ensureAutomationTab();
+    if (message?.type === "getPendingAutomationCommand") {
+        return getPendingAutomationCommand(sender);
     }
 
-    if (message?.type === "bridgeRequest") {
-        return proxyBridgeRequest(message, sender);
+    if (message?.type === "getPendingJob") {
+        return getPendingJob(sender);
+    }
+
+    if (message?.type === "reportSessionReady") {
+        return reportSessionReady(sender, message);
+    }
+
+    if (message?.type === "reportSessionError") {
+        return reportSessionError(sender, message);
+    }
+
+    if (message?.type === "reportJobResult") {
+        return reportJobResult(sender, message);
+    }
+
+    if (message?.type === "reportAutomationCommandResult") {
+        return reportAutomationCommandResult(sender, message);
     }
 
     if (message?.type === "debugLog") {
@@ -130,71 +110,363 @@ browser.runtime.onMessage.addListener((message, sender) => {
     return undefined;
 });
 
-async function ensureAutomationTab() {
-    await ensureNativeBridgeHost("ensureAutomationTab");
-    const automationTabs = await getAutomationTabs();
-    const lastAutomationTabId = await getLastAutomationTabId();
-    const candidateTabIds = [];
+void connectAgentIfConfigured("background-script");
 
-    if (typeof lastAutomationTabId === "number") {
-        candidateTabIds.push(lastAutomationTabId);
+async function saveAgentConfig(config) {
+    const normalized = normalizeAgentConfig(config);
+    if (!normalized) {
+        await browser.storage.local.remove(AGENT_CONFIG_KEY);
+        disconnectAgentSocket("Agent configuration was cleared.");
+        return { ok: true, cleared: true };
     }
 
-    for (const key of Object.keys(automationTabs)) {
-        const tabId = Number.parseInt(key, 10);
-        if (Number.isInteger(tabId) && !candidateTabIds.includes(tabId)) {
-            candidateTabIds.push(tabId);
+    await browser.storage.local.set({
+        [AGENT_CONFIG_KEY]: normalized
+    });
+    await appendDebugLog("background", "info", "Agent configuration was saved.", {
+        serverUrl: normalized.serverUrl
+    });
+    disconnectAgentSocket("Agent configuration changed.");
+    await connectAgentIfConfigured("save-config");
+    return { ok: true, cleared: false };
+}
+
+async function getAgentConfig() {
+    const result = await browser.storage.local.get(AGENT_CONFIG_KEY);
+    return normalizeAgentConfig(result[AGENT_CONFIG_KEY]);
+}
+
+function normalizeAgentConfig(value) {
+    if (!isPlainObject(value)) {
+        return null;
+    }
+
+    const serverUrl = normalizeHttpServerUrl(value.serverUrl);
+    const serverAccessToken = normalizeNullableString(value.serverAccessToken);
+    const userToken = normalizeNullableString(value.userToken);
+    if (!serverUrl || !serverAccessToken || !userToken) {
+        return null;
+    }
+
+    return {
+        serverUrl,
+        serverAccessToken,
+        userToken
+    };
+}
+
+async function connectAgentIfConfigured(reason) {
+    const config = await getAgentConfig();
+    if (!config) {
+        agentConnectionState = {
+            status: "idle",
+            detail: "Agent is not configured yet.",
+            serverUrl: null,
+            agentId: null,
+            userId: null,
+            connected: false
+        };
+        return { ...agentConnectionState };
+    }
+
+    if (agentSocket && (agentSocket.readyState === WebSocket.OPEN || agentSocket.readyState === WebSocket.CONNECTING)) {
+        return { ...agentConnectionState };
+    }
+
+    clearReconnectTimer();
+    connectionAttemptId += 1;
+    const attemptId = connectionAttemptId;
+    const websocketUrl = toAgentWebSocketUrl(config.serverUrl);
+    agentConnectionState = {
+        ...agentConnectionState,
+        status: "connecting",
+        detail: `Connecting to ${config.serverUrl} (${reason}).`,
+        serverUrl: config.serverUrl,
+        connected: false
+    };
+    await appendDebugLog("background", "info", "Connecting browser agent.", {
+        reason,
+        serverUrl: config.serverUrl
+    });
+
+    const socket = new WebSocket(websocketUrl);
+    agentSocket = socket;
+
+    socket.addEventListener("open", () => {
+        if (attemptId !== connectionAttemptId) {
+            socket.close();
+            return;
         }
-    }
 
-    for (const tabId of candidateTabIds) {
+        sendToAgent({
+            type: "agent.hello",
+            serverAccessToken: config.serverAccessToken,
+            userToken: config.userToken,
+            browserName: "firefox"
+        });
+    });
+
+    socket.addEventListener("message", async (event) => {
+        if (attemptId !== connectionAttemptId) {
+            return;
+        }
+
         try {
-            const tab = await browser.tabs.get(tabId);
-            if (tab.url?.startsWith("https://chatgpt.com/")) {
-                await focusTab(tab);
-                await appendDebugLog("background", "info", "Reused existing automation tab.", {
-                    tabId,
-                    url: tab.url
-                });
-                return { tabId: tab.id, reused: true };
-            }
+            const message = JSON.parse(event.data);
+            await handleAgentMessage(message);
         } catch (error) {
-            logBackground("warn", "Stored automation tab is no longer available.", {
-                tabId,
+            await appendDebugLog("background", "error", "Failed to handle a WebSocket message.", {
                 error: error instanceof Error ? error.message : String(error)
             });
-            await removeAutomationTab(tabId);
+        }
+    });
+
+    socket.addEventListener("close", async () => {
+        if (attemptId !== connectionAttemptId) {
+            return;
+        }
+
+        agentSocket = null;
+        agentConnectionState = {
+            ...agentConnectionState,
+            status: "disconnected",
+            detail: "WebSocket connection is closed.",
+            connected: false
+        };
+        await appendDebugLog("background", "warn", "Browser agent disconnected.", {
+            serverUrl: config.serverUrl
+        });
+        scheduleReconnect("socket-close");
+    });
+
+    socket.addEventListener("error", async () => {
+        if (attemptId !== connectionAttemptId) {
+            return;
+        }
+
+        agentConnectionState = {
+            ...agentConnectionState,
+            status: "error",
+            detail: "Failed to connect the browser agent.",
+            connected: false
+        };
+        await appendDebugLog("background", "error", "WebSocket connection failed.", {
+            serverUrl: config.serverUrl
+        });
+    });
+
+    return { ...agentConnectionState };
+}
+
+function disconnectAgentSocket(detail) {
+    clearReconnectTimer();
+    connectionAttemptId += 1;
+    if (agentSocket) {
+        try {
+            agentSocket.close();
+        } catch {
+            return;
+        } finally {
+            agentSocket = null;
         }
     }
 
+    agentConnectionState = {
+        ...agentConnectionState,
+        status: "idle",
+        detail: detail || null,
+        connected: false
+    };
+}
+
+function scheduleReconnect(reason) {
+    clearReconnectTimer();
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void connectAgentIfConfigured(reason);
+    }, RECONNECT_DELAY_MS);
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+}
+
+function sendToAgent(message) {
+    if (!agentSocket || agentSocket.readyState !== WebSocket.OPEN) {
+        throw new Error("The browser agent is not connected.");
+    }
+
+    agentSocket.send(JSON.stringify(message));
+}
+
+async function handleAgentMessage(message) {
+    if (message?.type === "agent.ready") {
+        agentConnectionState = {
+            status: "ready",
+            detail: "Browser agent is connected.",
+            serverUrl: agentConnectionState.serverUrl,
+            agentId: normalizeNullableString(message.agentId),
+            userId: normalizeNullableString(message.userId),
+            connected: true
+        };
+        await appendDebugLog("background", "info", "Browser agent is ready.", {
+            agentId: agentConnectionState.agentId,
+            userId: agentConnectionState.userId
+        });
+        return;
+    }
+
+    if (message?.type === "agent.error") {
+        agentConnectionState = {
+            ...agentConnectionState,
+            status: "error",
+            detail: normalizeNullableString(message.message) || "Agent error",
+            connected: false
+        };
+        await appendDebugLog("background", "error", "Browser agent reported an error.", {
+            message: message.message || null
+        });
+        return;
+    }
+
+    if (message?.type === "ping") {
+        sendToAgent({
+            type: "pong",
+            timestamp: message.timestamp || new Date().toISOString()
+        });
+        return;
+    }
+
+    if (message?.type === "session.start") {
+        await queueSessionStart(message);
+        return;
+    }
+
+    if (message?.type === "session.ask") {
+        queueSessionJob(message.sessionToken, {
+            commandId: message.commandId,
+            request: message.request
+        });
+        await appendDebugLog("background", "info", "Queued a session ask request.", {
+            sessionToken: message.sessionToken,
+            commandId: message.commandId
+        });
+        return;
+    }
+
+    if (message?.type === "session.setTemporary") {
+        queueSessionCommand(message.sessionToken, {
+            commandId: message.commandId,
+            type: "set-temporary"
+        });
+        await appendDebugLog("background", "info", "Queued a temporary-mode command.", {
+            sessionToken: message.sessionToken,
+            commandId: message.commandId
+        });
+        return;
+    }
+
+    if (message?.type === "session.release") {
+        await releaseSessionTab(message.sessionToken, message.commandId);
+    }
+}
+
+async function queueSessionStart(message) {
+    pendingLaunches.set(message.sessionToken, {
+        commandId: message.commandId,
+        openInTemporaryMode: Boolean(message.openInTemporaryMode)
+    });
+
     const createdTab = await browser.tabs.create({
-        url: CHATGPT_HOME_URL,
+        url: message.targetUrl || CHATGPT_HOME_URL,
         active: true
     });
 
-    if (typeof createdTab.id === "number") {
-        await setLastAutomationTabId(createdTab.id);
+    if (typeof createdTab.id !== "number") {
+        pendingLaunches.delete(message.sessionToken);
+        sendToAgent({
+            type: "session.error",
+            commandId: message.commandId,
+            sessionToken: message.sessionToken,
+            detail: "Failed to create an automation tab."
+        });
+        return;
     }
 
-    await appendDebugLog("background", "info", "Created new automation tab.", {
-        tabId: createdTab.id || null,
-        url: createdTab.url || CHATGPT_HOME_URL
+    await setAutomationTabMetadata(createdTab.id, {
+        sessionToken: message.sessionToken,
+        isTemporary: Boolean(message.openInTemporaryMode),
+        launchPending: true,
+        conversationUrl: null
     });
-
-    return { tabId: createdTab.id, reused: false };
+    await setLastAutomationTabId(createdTab.id);
+    await appendDebugLog("background", "info", "Created a new automation tab for a session.", {
+        tabId: createdTab.id,
+        sessionToken: message.sessionToken,
+        openInTemporaryMode: Boolean(message.openInTemporaryMode)
+    });
 }
 
-void ensureNativeBridgeHost("background-script");
+function queueSessionJob(sessionToken, job) {
+    const queue = pendingJobs.get(sessionToken) || [];
+    queue.push(job);
+    pendingJobs.set(sessionToken, queue);
+}
+
+function queueSessionCommand(sessionToken, command) {
+    const queue = pendingCommands.get(sessionToken) || [];
+    queue.push(command);
+    pendingCommands.set(sessionToken, queue);
+}
+
+async function releaseSessionTab(sessionToken, commandId) {
+    const tab = await findAutomationTabBySessionToken(sessionToken);
+    if (tab?.tabId) {
+        await removeAutomationTab(tab.tabId);
+        try {
+            await browser.tabs.remove(tab.tabId);
+        } catch {
+            // Ignore tabs that are already gone.
+        }
+    }
+
+    pendingJobs.delete(sessionToken);
+    pendingCommands.delete(sessionToken);
+    pendingLaunches.delete(sessionToken);
+    sendToAgent({
+        type: "session.released",
+        commandId,
+        sessionToken,
+        detail: "Session tab was released."
+    });
+}
+
+async function getAgentStatus() {
+    return {
+        ...agentConnectionState,
+        hasConfiguration: Boolean(await getAgentConfig())
+    };
+}
 
 async function isSenderAutomationTab(sender) {
     const metadata = await getSenderAutomationTabMetadata(sender);
     return {
-        isAutomationTab: Boolean(metadata && metadata.launchPending !== true),
+        isAutomationTab: Boolean(metadata),
         metadata: metadata || null
     };
 }
 
-async function claimAutomationTab(sender, message) {
+async function getAutomationContext(sender) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    return {
+        context: metadata
+    };
+}
+
+async function claimAutomationTab(sender) {
     if (typeof sender.tab?.id !== "number") {
         return {
             ok: false,
@@ -202,74 +474,235 @@ async function claimAutomationTab(sender, message) {
         };
     }
 
-    const existingMetadata = await getAutomationTabMetadata(sender.tab.id);
-    const urlLaunchContext = parseLaunchContext(sender.tab.url || "");
-    const bridgeBaseUrl = normalizeBridgeBaseUrl(message?.bridgeBaseUrl) || existingMetadata?.bridgeBaseUrl || urlLaunchContext?.bridgeBaseUrl;
-    const claimToken = normalizeNullableString(message?.claimToken) || existingMetadata?.claimToken || urlLaunchContext?.claimToken;
-    const sessionId = normalizeNullableString(message?.sessionId) || existingMetadata?.sessionId || urlLaunchContext?.sessionId;
-    const isTemporary = typeof message?.isTemporary === "boolean" ? message.isTemporary : existingMetadata?.isTemporary ?? urlLaunchContext?.isTemporary ?? false;
-
-    if (!bridgeBaseUrl) {
-        logBackground("warn", "Claim failed because bridge base URL is missing.", {
-            tabId: sender.tab.id,
-            senderUrl: sender.tab.url
-        });
+    const metadata = await getAutomationTabMetadata(sender.tab.id);
+    if (!metadata) {
         return {
             ok: false,
-            error: "Bridge base URL is missing."
+            error: "The current tab is not bound to a chat session."
         };
     }
 
-    const metadata = {
-        ...(existingMetadata || {}),
-        bridgeBaseUrl,
-        claimToken,
-        sessionId,
-        isTemporary,
+    await setAutomationTabMetadata(sender.tab.id, {
+        ...metadata,
         launchPending: false
-    };
-
-    await setAutomationTabMetadata(sender.tab.id, metadata);
+    });
     await setLastAutomationTabId(sender.tab.id);
-    logBackground("info", "Automation tab claimed.", {
-        tabId: sender.tab.id,
-        bridgeBaseUrl,
-        sessionId,
-        isTemporary
-    });
-    await emitBridgeLog(bridgeBaseUrl, "background", "info", "Automation tab claimed.", {
-        tabId: sender.tab.id,
-        sessionId,
-        isTemporary,
-        claimToken
-    });
     return {
         ok: true,
-        tabId: sender.tab.id,
-        bridgeBaseUrl,
-        claimToken,
-        sessionId
+        metadata: {
+            ...metadata,
+            launchPending: false
+        }
     };
 }
 
-async function getBridgeContext(sender) {
+async function getPendingAutomationCommand(sender) {
     const metadata = await getSenderAutomationTabMetadata(sender);
-    return {
-        bridgeContext: metadata
-    };
+    if (!metadata?.sessionToken) {
+        return null;
+    }
+
+    const queue = pendingCommands.get(metadata.sessionToken) || [];
+    if (!queue.length) {
+        return null;
+    }
+
+    const nextCommand = queue.shift();
+    pendingCommands.set(metadata.sessionToken, queue);
+    return nextCommand || null;
 }
 
-async function isSenderActiveTab(sender) {
-    if (typeof sender.tab?.id !== "number") {
+async function getPendingJob(sender) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
+        return null;
+    }
+
+    const queue = pendingJobs.get(metadata.sessionToken) || [];
+    if (!queue.length) {
+        return null;
+    }
+
+    const nextJob = queue.shift();
+    pendingJobs.set(metadata.sessionToken, queue);
+    return nextJob || null;
+}
+
+async function reportSessionReady(sender, message) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
         return {
-            isActiveTab: false
+            ok: false,
+            error: "The sender tab is not bound to a session."
         };
     }
 
-    const tab = await browser.tabs.get(sender.tab.id);
-    return {
-        isActiveTab: Boolean(tab.active)
-    };
+    const pendingLaunch = pendingLaunches.get(metadata.sessionToken);
+    if (!pendingLaunch) {
+        return {
+            ok: false,
+            error: "No pending launch was found for this session."
+        };
+    }
+
+    if (typeof sender.tab?.id === "number") {
+        await setAutomationTabMetadata(sender.tab.id, {
+            ...metadata,
+            launchPending: false,
+            isTemporary: Boolean(message?.isTemporary ?? metadata.isTemporary),
+            conversationUrl: normalizeNullableString(message?.conversationUrl) || metadata.conversationUrl
+        });
+    }
+
+    pendingLaunches.delete(metadata.sessionToken);
+    sendToAgent({
+        type: "session.ready",
+        commandId: pendingLaunch.commandId,
+        sessionToken: metadata.sessionToken,
+        tabId: sender.tab?.id,
+        detail: normalizeNullableString(message?.detail) || "The automation tab is ready.",
+        conversationUrl: normalizeNullableString(message?.conversationUrl) || null,
+        mode: message?.isTemporary ? "temporary" : "normal"
+    });
+    return { ok: true };
+}
+
+async function reportSessionError(sender, message) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
+        return {
+            ok: false,
+            error: "The sender tab is not bound to a session."
+        };
+    }
+
+    const pendingLaunch = pendingLaunches.get(metadata.sessionToken);
+    if (!pendingLaunch) {
+        return {
+            ok: false,
+            error: "No pending launch exists for this session."
+        };
+    }
+
+    pendingLaunches.delete(metadata.sessionToken);
+    sendToAgent({
+        type: "session.error",
+        commandId: pendingLaunch.commandId,
+        sessionToken: metadata.sessionToken,
+        detail: normalizeNullableString(message?.detail) || "The automation tab failed to initialize."
+    });
+    return { ok: true };
+}
+
+async function reportJobResult(sender, message) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
+        return {
+            ok: false,
+            error: "The sender tab is not bound to a session."
+        };
+    }
+
+    const commandId = normalizeNullableString(message?.commandId);
+    if (!commandId) {
+        return {
+            ok: false,
+            error: "commandId is required."
+        };
+    }
+
+    const detail = normalizeNullableString(message?.detail);
+    const conversationUrl = normalizeConversationUrl(message?.conversationUrl);
+    if (typeof sender.tab?.id === "number") {
+        await setAutomationTabMetadata(sender.tab.id, {
+            ...metadata,
+            conversationUrl: conversationUrl || metadata.conversationUrl
+        });
+    }
+
+    if (message?.status === "failed") {
+        sendToAgent({
+            type: "session.error",
+            commandId,
+            sessionToken: metadata.sessionToken,
+            detail: detail || "The prompt execution failed."
+        });
+        return { ok: true };
+    }
+
+    sendToAgent({
+        type: "session.askResult",
+        commandId,
+        sessionToken: metadata.sessionToken,
+        detail: detail || "Assistant response captured.",
+        responseText: `${message?.responseText || ""}`,
+        conversationUrl: conversationUrl || null,
+        mode: metadata.isTemporary ? "temporary" : "normal"
+    });
+    return { ok: true };
+}
+
+async function reportAutomationCommandResult(sender, message) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
+        return {
+            ok: false,
+            error: "The sender tab is not bound to a session."
+        };
+    }
+
+    const commandId = normalizeNullableString(message?.commandId);
+    if (!commandId) {
+        return {
+            ok: false,
+            error: "commandId is required."
+        };
+    }
+
+    if (message?.status === "failed") {
+        sendToAgent({
+            type: "session.error",
+            commandId,
+            sessionToken: metadata.sessionToken,
+            detail: normalizeNullableString(message?.detail) || "The automation command failed."
+        });
+        return { ok: true };
+    }
+
+    if (typeof sender.tab?.id === "number") {
+        await setAutomationTabMetadata(sender.tab.id, {
+            ...metadata,
+            isTemporary: Boolean(message?.isTemporary ?? true)
+        });
+    }
+
+    sendToAgent({
+        type: "session.commandResult",
+        commandId,
+        sessionToken: metadata.sessionToken,
+        detail: normalizeNullableString(message?.detail) || "Temporary chat mode is enabled.",
+        mode: message?.isTemporary === false ? "normal" : "temporary"
+    });
+    return { ok: true };
+}
+
+async function focusLastAutomationTab() {
+    const tabId = await getLastAutomationTabId();
+    if (typeof tabId !== "number") {
+        return false;
+    }
+
+    try {
+        const tab = await browser.tabs.get(tabId);
+        if (!tab.id) {
+            return false;
+        }
+
+        await focusTab(tab);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 async function getSenderAutomationTabMetadata(sender) {
@@ -277,7 +710,7 @@ async function getSenderAutomationTabMetadata(sender) {
         return null;
     }
 
-    return getAutomationTabMetadata(sender.tab.id);
+    return await getAutomationTabMetadata(sender.tab.id);
 }
 
 async function getAutomationTabs() {
@@ -292,17 +725,29 @@ async function getAutomationTabMetadata(tabId) {
     return isPlainObject(metadata) ? metadata : null;
 }
 
+async function findAutomationTabBySessionToken(sessionToken) {
+    const automationTabs = await getAutomationTabs();
+    for (const [tabId, metadata] of Object.entries(automationTabs)) {
+        if (metadata?.sessionToken === sessionToken) {
+            return {
+                tabId: Number.parseInt(tabId, 10),
+                metadata
+            };
+        }
+    }
+
+    return null;
+}
+
 async function setAutomationTabMetadata(tabId, metadata) {
     const automationTabs = await getAutomationTabs();
     automationTabs[String(tabId)] = {
-        bridgeBaseUrl: normalizeBridgeBaseUrl(metadata.bridgeBaseUrl),
-        claimToken: normalizeNullableString(metadata.claimToken),
-        sessionId: normalizeNullableString(metadata.sessionId),
-        isTemporary: Boolean(metadata.isTemporary),
+        sessionToken: normalizeNullableString(metadata.sessionToken),
         launchPending: Boolean(metadata.launchPending),
+        isTemporary: Boolean(metadata.isTemporary),
+        conversationUrl: normalizeConversationUrl(metadata.conversationUrl),
         updatedAt: new Date().toISOString()
     };
-
     await browser.storage.local.set({ [AUTOMATION_TABS_KEY]: automationTabs });
 }
 
@@ -318,7 +763,6 @@ async function removeAutomationTab(tabId) {
 
     delete automationTabs[String(tabId)];
     await browser.storage.local.set({ [AUTOMATION_TABS_KEY]: automationTabs });
-
     const lastAutomationTabId = await getLastAutomationTabId();
     if (lastAutomationTabId === tabId) {
         await browser.storage.local.remove(LAST_AUTOMATION_TAB_ID_KEY);
@@ -344,284 +788,7 @@ async function focusTab(tab) {
     }
 }
 
-async function proxyBridgeRequest(message, sender) {
-    if (typeof message.path !== "string" || !message.path.startsWith("/")) {
-        return {
-            ok: false,
-            status: 0,
-            statusText: "INVALID_PATH",
-            error: "Bridge path must start with '/'.",
-            body: null
-        };
-    }
-
-    const senderMetadata = await getSenderAutomationTabMetadata(sender);
-    const bridgeBaseUrl = normalizeBridgeBaseUrl(message?.bridgeBaseUrl) || senderMetadata?.bridgeBaseUrl;
-    await appendDebugLog("background", "debug", "bridgeRequest received.", {
-        path: message.path,
-        senderTabId: sender?.tab?.id || null,
-        senderUrl: sender?.tab?.url || null,
-        hasBoundBridge: Boolean(bridgeBaseUrl)
-    });
-    if (!bridgeBaseUrl) {
-        logBackground("warn", "bridgeRequest failed because no bridge is bound to the tab.", {
-            path: message.path,
-            senderTabId: sender?.tab?.id || null,
-            senderUrl: sender?.tab?.url || null,
-            senderMetadata: senderMetadata || null
-        });
-        return {
-            ok: false,
-            status: 0,
-            statusText: "UNBOUND_BRIDGE",
-            error: "Bridge base URL is not bound to this tab.",
-            body: null
-        };
-    }
-
-    const init = message.init && typeof message.init === "object" ? message.init : {};
-    const headers = new Headers(init.headers || {});
-    if (!headers.has("Content-Type") && typeof init.body === "string") {
-        headers.set("Content-Type", "application/json");
-    }
-
-    try {
-        const response = await fetch(`${bridgeBaseUrl}${message.path}`, {
-            method: init.method || "GET",
-            headers,
-            body: init.body,
-            cache: "no-store"
-        });
-
-        const contentType = response.headers.get("content-type") || "";
-        const text = response.status === 204 ? "" : await response.text();
-        let body = null;
-
-        if (text) {
-            if (contentType.includes("application/json")) {
-                try {
-                    body = JSON.parse(text);
-                } catch (error) {
-                    logBackground("warn", "Failed to parse JSON from bridge.", {
-                        path: message.path,
-                        error: error instanceof Error ? error.message : String(error)
-                    });
-                    body = text;
-                }
-            } else {
-                body = text;
-            }
-        }
-
-        return {
-            ok: response.ok,
-            status: response.status,
-            statusText: response.statusText,
-            error: null,
-            body
-        };
-    } catch (error) {
-        logBackground("error", "Proxy bridge request failed.", {
-            path: message.path,
-            bridgeBaseUrl,
-            error: error instanceof Error ? error.message : String(error)
-        });
-        await emitBridgeLog(bridgeBaseUrl, "background", "error", "Proxy bridge request failed.", {
-            path: message.path,
-            error: error instanceof Error ? error.message : String(error)
-        });
-        return {
-            ok: false,
-            status: 0,
-            statusText: "FETCH_ERROR",
-            error: error instanceof Error ? error.message : String(error),
-            body: null
-        };
-    }
-}
-
-async function ensureNativeBridgeHost(reason) {
-    if (nativeBridgeState.status === "ready" && nativeBridgeState.connected) {
-        return { ...nativeBridgeState };
-    }
-
-    if (nativeHostConnectPromise) {
-        return await nativeHostConnectPromise;
-    }
-
-    nativeHostConnectPromise = (async () => {
-        try {
-            if (!nativeHostPort) {
-                attachNativeHostPort(browser.runtime.connectNative(NATIVE_HOST_NAME));
-            }
-
-            postToNativeHost({
-                type: "ensureBridge",
-                bridgeHost: DEFAULT_NATIVE_BRIDGE_HOST,
-                bridgePort: DEFAULT_NATIVE_BRIDGE_PORT,
-                sessionId: DEFAULT_NATIVE_BRIDGE_SESSION_ID
-            });
-            await waitForNativeBridgeReady(NATIVE_BRIDGE_READY_TIMEOUT_MS);
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            nativeBridgeState.lastError = message;
-            logBackground("warn", "Failed to initialize the native bridge host.", {
-                reason,
-                error: message,
-                hostName: NATIVE_HOST_NAME,
-                installHint: "Run `npm run install:firefox-host` and reload the extension."
-            });
-        } finally {
-            nativeHostConnectPromise = null;
-        }
-
-        return { ...nativeBridgeState };
-    })();
-
-    return await nativeHostConnectPromise;
-}
-
-function attachNativeHostPort(port) {
-    nativeHostPort = port;
-    nativeBridgeState.connected = true;
-    nativeBridgeState.lastError = null;
-
-    port.onMessage.addListener((message) => {
-        handleNativeHostMessage(message).catch((error) => {
-            logBackground("warn", "Failed to handle a native host message.", {
-                error: error instanceof Error ? error.message : String(error)
-            });
-        });
-    });
-
-    port.onDisconnect.addListener(() => {
-        const disconnectError = browser.runtime.lastError?.message || null;
-        nativeHostPort = null;
-        nativeBridgeState = {
-            ...nativeBridgeState,
-            connected: false,
-            lastError: disconnectError,
-            status: disconnectError ? "error" : "stopped"
-        };
-        logBackground(disconnectError ? "warn" : "info", "Native bridge host disconnected.", {
-            error: disconnectError,
-            hostName: NATIVE_HOST_NAME
-        });
-    });
-}
-
-function postToNativeHost(message) {
-    if (!nativeHostPort) {
-        throw new Error("Native bridge host is not connected.");
-    }
-
-    nativeHostPort.postMessage(message);
-}
-
-async function handleNativeHostMessage(message) {
-    if (message?.type === "host-ready") {
-        await appendDebugLog("native-host", "info", "Native bridge host connected.", {
-            pid: message.pid || null,
-            bridgeEntryPath: message.bridgeEntryPath || null
-        });
-        return;
-    }
-
-    if (message?.type === "bridge-status") {
-        nativeBridgeState = {
-            ...nativeBridgeState,
-            status: normalizeNullableString(message.status) || nativeBridgeState.status,
-            baseUrl: normalizeBridgeBaseUrl(message.baseUrl),
-            sessionId: normalizeNullableString(message.sessionId),
-            detail: normalizeNullableString(message.detail),
-            pid: typeof message.pid === "number" ? message.pid : null,
-            source: normalizeNullableString(message.source) || "none",
-            connected: true,
-            lastError: message.status === "error" ? normalizeNullableString(message.detail) : null
-        };
-
-        await appendDebugLog("native-host", message.status === "error" ? "error" : "info", "Native bridge host status changed.", {
-            status: nativeBridgeState.status,
-            baseUrl: nativeBridgeState.baseUrl,
-            pid: nativeBridgeState.pid,
-            detail: nativeBridgeState.detail,
-            source: nativeBridgeState.source
-        });
-        return;
-    }
-
-    if (message?.type === "bridge-log") {
-        const line = normalizeNullableString(message.line);
-        if (!line) {
-            return;
-        }
-
-        await appendDebugLog("native-host", parseNativeHostLogLevel(line), line, {
-            stream: normalizeNullableString(message.stream) || "stderr"
-        });
-    }
-}
-
-async function waitForNativeBridgeReady(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-        if (nativeBridgeState.status === "ready" && nativeBridgeState.baseUrl) {
-            return nativeBridgeState;
-        }
-
-        if (nativeBridgeState.status === "error") {
-            throw new Error(nativeBridgeState.detail || "Native bridge host reported an error.");
-        }
-
-        await sleep(100);
-    }
-
-    throw new Error("Timed out while waiting for the native bridge host to start the local bridge.");
-}
-
-function parseLaunchContext(urlString) {
-    try {
-        const url = new URL(urlString);
-        if (!url.href.startsWith("https://chatgpt.com/")) {
-            return null;
-        }
-
-        const claimToken = normalizeNullableString(readLaunchParam(url, BRIDGE_CLAIM_QUERY_PARAM));
-        const bridgePort = normalizeBridgePort(readLaunchParam(url, BRIDGE_PORT_QUERY_PARAM));
-        if (!claimToken || !bridgePort) {
-            return null;
-        }
-
-        return {
-            bridgeBaseUrl: `http://127.0.0.1:${bridgePort}`,
-            claimToken,
-            sessionId: normalizeNullableString(readLaunchParam(url, BRIDGE_SESSION_QUERY_PARAM)),
-            isTemporary: parseBridgeBoolean(readLaunchParam(url, BRIDGE_TEMPORARY_QUERY_PARAM))
-        };
-    } catch (error) {
-        logBackground("warn", "Failed to parse launch context.", {
-            urlString,
-            error: error instanceof Error ? error.message : String(error)
-        });
-        return null;
-    }
-}
-
-function readLaunchParam(url, key) {
-    const queryValue = url.searchParams.get(key);
-    if (queryValue) {
-        return queryValue;
-    }
-
-    const hash = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
-    if (!hash) {
-        return null;
-    }
-
-    return new URLSearchParams(hash).get(key);
-}
-
-function normalizeBridgeBaseUrl(value) {
+function normalizeHttpServerUrl(value) {
     if (typeof value !== "string") {
         return null;
     }
@@ -633,28 +800,43 @@ function normalizeBridgeBaseUrl(value) {
 
     try {
         const url = new URL(trimmed);
-        if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port) {
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
             return null;
         }
 
-        return `${url.protocol}//${url.hostname}:${url.port}`;
+        url.hash = "";
+        url.search = "";
+        return url.toString().replace(/\/+$/, "");
     } catch {
         return null;
     }
 }
 
-function normalizeBridgePort(value) {
-    const text = typeof value === "string" ? value.trim() : "";
-    if (!/^\d+$/.test(text)) {
+function toAgentWebSocketUrl(serverUrl) {
+    const url = new URL(serverUrl);
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/agent/ws`;
+    url.search = "";
+    url.hash = "";
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+}
+
+function normalizeConversationUrl(value) {
+    const normalized = normalizeNullableString(value);
+    if (!normalized) {
         return null;
     }
 
-    const port = Number.parseInt(text, 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    try {
+        const url = new URL(normalized);
+        if (url.origin !== "https://chatgpt.com") {
+            return null;
+        }
+
+        return url.href;
+    } catch {
         return null;
     }
-
-    return port;
 }
 
 function normalizeNullableString(value) {
@@ -666,79 +848,8 @@ function normalizeNullableString(value) {
     return trimmed || null;
 }
 
-function parseBridgeBoolean(value) {
-    if (value === null || value === undefined) {
-        return false;
-    }
-
-    return !/^(0|false|no|off)$/i.test(`${value}`.trim());
-}
-
-function parseNativeHostLogLevel(line) {
-    const normalizedLine = `${line || ""}`.toLowerCase();
-    if (normalizedLine.includes("[error]")) {
-        return "error";
-    }
-
-    if (normalizedLine.includes("[warn]")) {
-        return "warn";
-    }
-
-    if (normalizedLine.includes("[debug]")) {
-        return "debug";
-    }
-
-    return "info";
-}
-
-function resolveLaunchPending(existingMetadata, launchContext) {
-    if (!existingMetadata) {
-        return true;
-    }
-
-    const isSameLaunch =
-        normalizeNullableString(existingMetadata.claimToken) === normalizeNullableString(launchContext.claimToken) &&
-        normalizeNullableString(existingMetadata.sessionId) === normalizeNullableString(launchContext.sessionId) &&
-        normalizeBridgeBaseUrl(existingMetadata.bridgeBaseUrl) === normalizeBridgeBaseUrl(launchContext.bridgeBaseUrl);
-
-    if (isSameLaunch && existingMetadata.launchPending === false) {
-        return false;
-    }
-
-    return true;
-}
-
 function isPlainObject(value) {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-async function emitBridgeLog(bridgeBaseUrl, source, level, message, context) {
-    const normalizedBridgeBaseUrl = normalizeBridgeBaseUrl(bridgeBaseUrl);
-    if (!normalizedBridgeBaseUrl) {
-        return;
-    }
-
-    try {
-        await fetch(`${normalizedBridgeBaseUrl}/logs/client`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                source,
-                level,
-                message,
-                context
-            }),
-            cache: "no-store"
-        });
-    } catch (error) {
-        logBackground("warn", "Failed to send diagnostic log to bridge.", {
-            bridgeBaseUrl: normalizedBridgeBaseUrl,
-            message,
-            error: error instanceof Error ? error.message : String(error)
-        });
-    }
 }
 
 async function appendDebugLog(source, level, message, context) {
@@ -759,21 +870,8 @@ async function appendDebugLog(source, level, message, context) {
         context: isPlainObject(context) ? context : {}
     });
 
-    const nextLogs = currentLogs.slice(-DEBUG_LOG_LIMIT);
-    await browser.storage.local.set({ [DEBUG_LOGS_KEY]: nextLogs });
+    await browser.storage.local.set({
+        [DEBUG_LOGS_KEY]: currentLogs.slice(-DEBUG_LOG_LIMIT)
+    });
     return { ok: true };
-}
-
-function logBackground(level, message, context) {
-    const consoleMethod =
-        level === "error" ? console.error :
-            level === "warn" ? console.warn :
-                level === "debug" ? console.debug :
-                    console.info;
-    consoleMethod(`[chatgpt-web-bridge/background] ${message}`, context);
-    void appendDebugLog("background", level, message, context);
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }

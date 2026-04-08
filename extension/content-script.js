@@ -1,9 +1,5 @@
 (function () {
     const CHATGPT_HOME_URL = "https://chatgpt.com/";
-    const BRIDGE_CLAIM_QUERY_PARAM = "bridgeClaim";
-    const BRIDGE_PORT_QUERY_PARAM = "bridgePort";
-    const BRIDGE_SESSION_QUERY_PARAM = "bridgeSessionId";
-    const BRIDGE_TEMPORARY_QUERY_PARAM = "bridgeTemporary";
     const TEMPORARY_CHAT_QUERY_PARAM = "temporary-chat";
     const POLL_DELAY_MS = 2000;
     const SHORT_DELAY_MS = 250;
@@ -22,22 +18,58 @@
 
     let loopStarted = false;
     let currentJobId = null;
-    let currentAutomationCommandToken = null;
+    let currentAutomationCommandId = null;
     let lastLoopStateSignature = null;
 
-    handleBridgeLaunchParams().catch((error) => {
-        console.error("[chatgpt-web-bridge] Failed to process launch params.", error);
-        void emitDiagnosticLog("error", "Failed to process launch params.", {
+    initializeAutomationTab().catch((error) => {
+        console.error("[chatgpt-web-bridge] Failed to initialize the automation tab.", error);
+        void emitDiagnosticLog("error", "Failed to initialize the automation tab.", {
             error: error instanceof Error ? error.message : String(error)
         });
     });
 
     startLoop().catch((error) => {
-        console.error("[chatgpt-web-bridge] Failed to start content loop.", error);
-        void emitDiagnosticLog("error", "Failed to start content loop.", {
+        console.error("[chatgpt-web-bridge] Failed to start the content loop.", error);
+        void emitDiagnosticLog("error", "Failed to start the content loop.", {
             error: error instanceof Error ? error.message : String(error)
         });
     });
+
+    async function initializeAutomationTab() {
+        const claimResult = await browser.runtime.sendMessage({
+            type: "claimAutomationTab"
+        });
+        if (!claimResult?.ok) {
+            return;
+        }
+
+        try {
+            const metadata = claimResult.metadata || null;
+            const composer = await waitForComposer(DEFAULT_WAIT_MS);
+            if (!composer) {
+                throw new Error("Composer was not found on the page.");
+            }
+
+            if (metadata?.isTemporary) {
+                const enabled = await ensureTemporaryChatMode(DEFAULT_WAIT_MS);
+                if (!enabled) {
+                    throw new Error("Temporary chat mode could not be enabled.");
+                }
+            }
+
+            await browser.runtime.sendMessage({
+                type: "reportSessionReady",
+                detail: metadata?.isTemporary ? "Temporary chat is ready." : "Fresh chat is ready.",
+                isTemporary: Boolean(metadata?.isTemporary),
+                conversationUrl: extractConversationUrl(location.href) || undefined
+            });
+        } catch (error) {
+            await browser.runtime.sendMessage({
+                type: "reportSessionError",
+                detail: error instanceof Error ? error.message : String(error)
+            });
+        }
+    }
 
     async function startLoop() {
         if (loopStarted) {
@@ -45,51 +77,47 @@
         }
 
         loopStarted = true;
-        console.info("[chatgpt-web-bridge] Content loop started.");
         await emitDiagnosticLog("info", "Content loop started.", {
             url: location.href
         });
 
         while (true) {
             try {
-                const isAutomationTab = await isDedicatedAutomationTab();
-                if (!isAutomationTab.isAutomationTab) {
+                const automationTab = await isDedicatedAutomationTab();
+                if (!automationTab.isAutomationTab) {
                     await recordLoopState("waiting-for-automation-tab", {
-                        url: location.href,
-                        bridgeContext: isAutomationTab.metadata || null
-                    });
-                    await sleep(POLL_DELAY_MS);
-                    continue;
-                }
-
-                if (!currentJobId && !currentAutomationCommandToken) {
-                    const command = await getPendingAutomationCommand();
-                    if (command) {
-                        console.info("[chatgpt-web-bridge] Received automation command.", command.token, command.type);
-                        currentAutomationCommandToken = command.token;
-                        await executeAutomationCommand(command);
-                        continue;
-                    }
-                }
-
-                const activeSession = await getActiveSession();
-                if (!activeSession) {
-                    await recordLoopState("waiting-for-active-session", {
                         url: location.href
                     });
                     await sleep(POLL_DELAY_MS);
                     continue;
                 }
 
-                if (!ensureCorrectPage(activeSession)) {
-                    await recordLoopState("waiting-for-correct-page", {
-                        url: location.href,
-                        targetUrl: activeSession.targetUrl,
-                        freshChatRequired: activeSession.freshChatRequired
+                const automationContext = await getAutomationContext();
+                const metadata = automationContext?.context || null;
+                if (!metadata?.sessionToken) {
+                    await recordLoopState("waiting-for-session-context", {
+                        url: location.href
                     });
-                    console.info("[chatgpt-web-bridge] Waiting for the automation tab to reach the correct page.");
                     await sleep(POLL_DELAY_MS);
                     continue;
+                }
+
+                if (!ensureCorrectPage(metadata)) {
+                    await recordLoopState("waiting-for-correct-page", {
+                        url: location.href,
+                        conversationUrl: metadata.conversationUrl || null
+                    });
+                    await sleep(POLL_DELAY_MS);
+                    continue;
+                }
+
+                if (!currentAutomationCommandId) {
+                    const command = await getPendingAutomationCommand();
+                    if (command) {
+                        currentAutomationCommandId = command.commandId;
+                        await executeAutomationCommand(command);
+                        continue;
+                    }
                 }
 
                 if (currentJobId) {
@@ -101,26 +129,19 @@
                     continue;
                 }
 
-                const job = await getNextJob(activeSession.sessionId);
+                const job = await getPendingJob();
                 if (!job) {
                     await recordLoopState("waiting-for-job", {
-                        sessionId: activeSession.sessionId,
+                        sessionToken: metadata.sessionToken,
                         url: location.href
                     });
                     await sleep(POLL_DELAY_MS);
                     continue;
                 }
 
-                await recordLoopState("job-received", {
-                    sessionId: activeSession.sessionId,
-                    jobId: job.id,
-                    textLength: job.text?.length || 0
-                });
-                console.info("[chatgpt-web-bridge] Received job.", job.id, activeSession.sessionId);
-                currentJobId = job.id;
-                await executeJob(job, activeSession);
+                currentJobId = job.commandId;
+                await executeJob(job, metadata);
             } catch (error) {
-                console.error("[chatgpt-web-bridge] Polling loop error.", error);
                 await emitDiagnosticLog("error", "Polling loop error.", {
                     error: error instanceof Error ? error.message : String(error),
                     url: location.href
@@ -132,45 +153,27 @@
 
     async function executeAutomationCommand(command) {
         try {
-            console.info("[chatgpt-web-bridge] Starting automation command.", command.token, command.type);
-            await emitDiagnosticLog("info", "Starting automation command.", {
-                token: command.token,
-                type: command.type
-            });
-            await updateAutomationCommand(command.token, "running", "Automation command is being processed.");
-
             if (command.type === "set-temporary") {
-                await executeSetTemporaryCommand(command.token);
+                await executeSetTemporaryCommand(command.commandId);
                 return;
             }
 
             throw new Error(`Unsupported automation command: ${command.type}`);
         } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            try {
-                await updateAutomationCommand(command.token, "failed", message);
-            } catch (reportError) {
-                console.warn("[chatgpt-web-bridge] Failed to report automation command failure.", reportError);
-            }
-
-            console.error("[chatgpt-web-bridge] Automation command failed.", command.token, message);
-            await emitDiagnosticLog("error", "Automation command failed.", {
-                token: command.token,
-                type: command.type,
-                error: message
+            await browser.runtime.sendMessage({
+                type: "reportAutomationCommandResult",
+                commandId: command.commandId,
+                status: "failed",
+                detail: error instanceof Error ? error.message : String(error)
             });
         } finally {
-            currentAutomationCommandToken = null;
+            currentAutomationCommandId = null;
             await sleep(POLL_DELAY_MS);
         }
     }
 
-    async function executeSetTemporaryCommand(token) {
+    async function executeSetTemporaryCommand(commandId) {
         if (!isChatHome(location.href)) {
-            console.info("[chatgpt-web-bridge] Redirecting to a fresh chat before enabling temporary mode.", location.href);
-            await emitDiagnosticLog("info", "Redirecting to a fresh chat before enabling temporary mode.", {
-                url: location.href
-            });
             location.href = CHATGPT_HOME_URL;
             return;
         }
@@ -185,41 +188,24 @@
             throw new Error("Temporary chat mode could not be enabled.");
         }
 
-        const composerAfterSwitch = await waitForComposer(DEFAULT_WAIT_MS);
-        if (!composerAfterSwitch) {
-            throw new Error("Composer did not become ready after temporary chat was enabled.");
-        }
-
-        await updateAutomationCommand(token, "completed", "Temporary chat mode is enabled.");
-        console.info("[chatgpt-web-bridge] Automation command completed.", token, "set-temporary");
-        await emitDiagnosticLog("info", "Automation command completed.", {
-            token,
-            type: "set-temporary",
-            url: location.href
+        await browser.runtime.sendMessage({
+            type: "reportAutomationCommandResult",
+            commandId,
+            status: "completed",
+            detail: "Temporary chat mode is enabled.",
+            isTemporary: true
         });
     }
 
-    async function executeJob(job, activeSession) {
+    async function executeJob(job, metadata) {
         try {
-            console.info("[chatgpt-web-bridge] Starting job execution.", job.id);
-            await emitDiagnosticLog("info", "Starting job execution.", {
-                jobId: job.id,
-                sessionId: activeSession.sessionId,
-                targetUrl: activeSession.targetUrl,
-                url: location.href
-            });
-            await updateJobStatus(job.id, {
-                status: "running",
-                detail: "Content script started processing the job."
-            });
-
             const composer = await waitForComposer(DEFAULT_WAIT_MS);
             if (!composer) {
                 throw new Error("Composer was not found on the page.");
             }
 
             clearComposer(composer);
-            const inserted = await insertPromptText(composer, job.text);
+            const inserted = await insertPromptText(composer, job.request);
             if (!inserted) {
                 throw new Error("Failed to insert text into the ChatGPT composer.");
             }
@@ -239,7 +225,7 @@
             const conversationUrl =
                 (await waitForConversationUrl(5000)) ||
                 extractConversationUrl(location.href) ||
-                activeSession.conversationUrl ||
+                metadata.conversationUrl ||
                 undefined;
 
             const assistantResponse = await waitForAssistantResponse(previousAssistantSnapshot, RESPONSE_TIMEOUT_MS);
@@ -247,36 +233,21 @@
                 throw new Error("Assistant response was not captured in time.");
             }
 
-            await updateJobStatus(job.id, {
+            await browser.runtime.sendMessage({
+                type: "reportJobResult",
+                commandId: job.commandId,
                 status: "sent",
-                detail: "Prompt was submitted and the assistant response was captured.",
+                detail: "Assistant response was captured.",
                 conversationUrl,
                 responseText: assistantResponse.text
             });
-            console.info(
-                "[chatgpt-web-bridge] Job completed.",
-                job.id,
-                conversationUrl || "no-conversation-url",
-                `response-length=${assistantResponse.text.length}`
-            );
-            await emitDiagnosticLog("info", "Job completed.", {
-                jobId: job.id,
-                conversationUrl: conversationUrl || null,
-                responseLength: assistantResponse.text.length,
-                url: location.href
-            });
         } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            await updateJobStatus(job.id, {
+            await browser.runtime.sendMessage({
+                type: "reportJobResult",
+                commandId: job.commandId,
                 status: "failed",
-                detail: message,
+                detail: error instanceof Error ? error.message : String(error),
                 conversationUrl: extractConversationUrl(location.href) || undefined
-            });
-            console.error("[chatgpt-web-bridge] Job failed.", job.id, message);
-            await emitDiagnosticLog("error", "Job failed.", {
-                jobId: job.id,
-                error: message,
-                url: location.href
             });
         } finally {
             currentJobId = null;
@@ -285,97 +256,31 @@
     }
 
     async function isDedicatedAutomationTab() {
-        const result = await browser.runtime.sendMessage({ type: "isAutomationTab" });
+        const result = await browser.runtime.sendMessage({
+            type: "isAutomationTab"
+        });
         return {
             isAutomationTab: Boolean(result?.isAutomationTab),
             metadata: result?.metadata || null
         };
     }
 
-    async function getActiveSession() {
-        const response = await bridgeRequest("/session/active");
-        if (response.status === 204) {
-            return null;
-        }
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch active session: ${response.status}`);
-        }
-
-        return response.body;
-    }
-
-    async function getNextJob(sessionId) {
-        const response = await bridgeRequest(`/session/next?sessionId=${encodeURIComponent(sessionId)}`);
-        if (response.status === 204) {
-            return null;
-        }
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch next job: ${response.status}`);
-        }
-
-        return response.body;
+    async function getAutomationContext() {
+        return await browser.runtime.sendMessage({
+            type: "getAutomationContext"
+        });
     }
 
     async function getPendingAutomationCommand() {
-        const response = await bridgeRequest("/automation/command");
-        if (response.status === 204) {
-            return null;
-        }
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch automation command: ${response.status}`);
-        }
-
-        return response.body;
-    }
-
-    async function updateJobStatus(jobId, payload) {
-        const response = await bridgeRequest(`/jobs/${encodeURIComponent(jobId)}/status`, {
-            method: "POST",
-            body: JSON.stringify(payload)
+        return await browser.runtime.sendMessage({
+            type: "getPendingAutomationCommand"
         });
-
-        if (!response.ok) {
-            console.warn("[chatgpt-web-bridge] Failed to update job status.", jobId, response.status);
-        }
     }
 
-    async function updateAutomationCommand(token, status, detail) {
-        const response = await bridgeRequest("/automation/command/status", {
-            method: "POST",
-            body: JSON.stringify({ token, status, detail })
+    async function getPendingJob() {
+        return await browser.runtime.sendMessage({
+            type: "getPendingJob"
         });
-
-        if (!response.ok) {
-            throw new Error(`Failed to update automation command: ${response.status}`);
-        }
-
-        return response.body;
-    }
-
-    async function bridgeRequest(path, init = {}) {
-        const message = {
-            type: "bridgeRequest",
-            path,
-            init: {
-                method: init.method || "GET",
-                body: typeof init.body === "string" ? init.body : undefined,
-                headers: init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : undefined
-            }
-        };
-
-        const response = await browser.runtime.sendMessage(message);
-        if (!response) {
-            throw new Error("Extension background did not respond.");
-        }
-
-        if (response.status === 0) {
-            throw new Error(`Bridge request failed: ${response.error || "Unknown error"}`);
-        }
-
-        return response;
     }
 
     async function emitDiagnosticLog(level, message, context = {}) {
@@ -387,36 +292,8 @@
                 message,
                 context
             });
-        } catch (error) {
-            console.warn("[chatgpt-web-bridge] Failed to store local diagnostic log.", {
-                level,
-                message,
-                error: error instanceof Error ? error.message : String(error)
-            });
-        }
-
-        try {
-            const bridgeContextResult = await browser.runtime.sendMessage({ type: "getBridgeContext" });
-            const bridgeContext = bridgeContextResult?.bridgeContext;
-            if (!bridgeContext?.bridgeBaseUrl) {
-                return;
-            }
-
-            await bridgeRequest("/logs/client", {
-                method: "POST",
-                body: JSON.stringify({
-                    source: "content-script",
-                    level,
-                    message,
-                    context
-                })
-            });
-        } catch (error) {
-            console.warn("[chatgpt-web-bridge] Failed to send diagnostic log to bridge.", {
-                level,
-                message,
-                error: error instanceof Error ? error.message : String(error)
-            });
+        } catch {
+            return;
         }
     }
 
@@ -430,165 +307,10 @@
         await emitDiagnosticLog("debug", `Loop state: ${state}`, context);
     }
 
-    async function handleBridgeLaunchParams() {
-        const launch = await getPendingLaunchContext();
-        if (!launch) {
-            try {
-                await browser.runtime.sendMessage({
-                    type: "debugLog",
-                    source: "content-script",
-                    level: "debug",
-                    message: "No pending launch context was found on page load.",
-                    context: {
-                        url: location.href
-                    }
-                });
-            } catch (error) {
-                console.warn("[chatgpt-web-bridge] Failed to store launch-context diagnostic log.", error);
-            }
-            return;
-        }
-
-        try {
-            const claimResult = await browser.runtime.sendMessage({
-                type: "claimAutomationTab",
-                bridgeBaseUrl: launch.bridgeBaseUrl,
-                claimToken: launch.token,
-                sessionId: launch.sessionId || undefined,
-                isTemporary: launch.isTemporary
-            });
-            if (!claimResult?.ok) {
-                throw new Error(claimResult?.error || "Failed to claim the automation tab.");
-            }
-
-            await emitDiagnosticLog("info", "Automation tab claimed from launch params.", {
-                token: launch.token,
-                sessionId: launch.sessionId,
-                isTemporary: launch.isTemporary,
-                bridgeBaseUrl: launch.bridgeBaseUrl,
-                fromUrlParams: launch.fromUrlParams,
-                url: location.href
-            });
-
-            await updateAutomationLaunch(launch.token, "claimed", "Automation tab claimed.");
-            const composer = await waitForComposer(DEFAULT_WAIT_MS);
-            if (!composer) {
-                throw new Error("Composer was not found on the fresh chat page.");
-            }
-
-            if (launch.isTemporary) {
-                const enabled = await ensureTemporaryChatMode(DEFAULT_WAIT_MS);
-                if (!enabled) {
-                    throw new Error("Temporary chat mode could not be enabled.");
-                }
-            }
-
-            await updateAutomationLaunch(
-                launch.token,
-                "ready",
-                launch.isTemporary ? "Temporary chat is ready." : "Fresh chat is ready."
-            );
-            await emitDiagnosticLog("info", "Automation launch is ready.", {
-                token: launch.token,
-                isTemporary: launch.isTemporary,
-                url: location.href
-            });
-            if (launch.fromUrlParams) {
-                clearBridgeLaunchParams();
-            }
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            try {
-                await updateAutomationLaunch(launch.token, "failed", message);
-            } catch (reportError) {
-                console.warn("[chatgpt-web-bridge] Failed to report launch failure.", reportError);
-            }
-
-            throw error;
-        }
-    }
-
-    async function getPendingLaunchContext() {
-        const params = getBridgeLaunchParams();
-        if (params) {
-            return {
-                ...params,
-                fromUrlParams: true
-            };
-        }
-
-        const bridgeContextResult = await browser.runtime.sendMessage({ type: "getBridgeContext" });
-        const bridgeContext = bridgeContextResult?.bridgeContext;
-        if (!bridgeContext?.launchPending || !bridgeContext?.claimToken || !bridgeContext?.bridgeBaseUrl) {
-            return null;
-        }
-
-        return {
-            token: bridgeContext.claimToken,
-            bridgeBaseUrl: bridgeContext.bridgeBaseUrl,
-            sessionId: bridgeContext.sessionId || null,
-            isTemporary: Boolean(bridgeContext.isTemporary),
-            fromUrlParams: false
-        };
-    }
-
-    function getBridgeLaunchParams() {
-        const url = new URL(location.href);
-        const token = readLaunchParam(url, BRIDGE_CLAIM_QUERY_PARAM);
-        const bridgeBaseUrl = getBridgeBaseUrlFromUrl(url);
-        if (!token || !bridgeBaseUrl) {
-            return null;
-        }
-
-        return {
-            token,
-            bridgeBaseUrl,
-            sessionId: normalizeNullableString(readLaunchParam(url, BRIDGE_SESSION_QUERY_PARAM)),
-            isTemporary: parseBridgeBoolean(readLaunchParam(url, BRIDGE_TEMPORARY_QUERY_PARAM))
-        };
-    }
-
-    function parseBridgeBoolean(value) {
-        if (value === null) {
-            return false;
-        }
-
-        return !/^(0|false|no|off)$/i.test(`${value}`.trim());
-    }
-
-    async function updateAutomationLaunch(token, status, detail) {
-        const response = await bridgeRequest("/automation/claim", {
-            method: "POST",
-            body: JSON.stringify({ token, status, detail })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Failed to update automation launch: ${response.status}`);
-        }
-
-        return response.body;
-    }
-
-    function clearBridgeLaunchParams() {
-        const url = new URL(location.href);
-        url.searchParams.delete(BRIDGE_CLAIM_QUERY_PARAM);
-        url.searchParams.delete(BRIDGE_PORT_QUERY_PARAM);
-        url.searchParams.delete(BRIDGE_SESSION_QUERY_PARAM);
-        url.searchParams.delete(BRIDGE_TEMPORARY_QUERY_PARAM);
-        const hashParams = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
-        hashParams.delete(BRIDGE_CLAIM_QUERY_PARAM);
-        hashParams.delete(BRIDGE_PORT_QUERY_PARAM);
-        hashParams.delete(BRIDGE_SESSION_QUERY_PARAM);
-        hashParams.delete(BRIDGE_TEMPORARY_QUERY_PARAM);
-        url.hash = hashParams.toString();
-        history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-    }
-
-    function ensureCorrectPage(activeSession) {
-        const targetUrl = activeSession.targetUrl || CHATGPT_HOME_URL;
-        if (activeSession.freshChatRequired) {
+    function ensureCorrectPage(metadata) {
+        const targetUrl = metadata?.conversationUrl || CHATGPT_HOME_URL;
+        if (!metadata?.conversationUrl) {
             if (!isChatHome(location.href)) {
-                console.info("[chatgpt-web-bridge] Redirecting automation tab to a fresh chat.", location.href);
                 location.href = CHATGPT_HOME_URL;
                 return false;
             }
@@ -597,7 +319,6 @@
         }
 
         if (!location.href.startsWith(targetUrl)) {
-            console.info("[chatgpt-web-bridge] Redirecting automation tab to an existing conversation.", targetUrl);
             location.href = targetUrl;
             return false;
         }
@@ -610,7 +331,7 @@
             const parsedUrl = new URL(url, CHATGPT_HOME_URL);
             return parsedUrl.origin === "https://chatgpt.com" && isChatHomePath(parsedUrl.pathname);
         } catch (error) {
-            console.warn("[chatgpt-web-bridge] Failed to parse chat home URL.", url, error);
+            console.warn("[chatgpt-web-bridge] Failed to parse a ChatGPT home URL.", url, error);
             return url === CHATGPT_HOME_URL || url === "https://chatgpt.com";
         }
     }
@@ -639,7 +360,6 @@
     function clearComposer(composer) {
         composer.focus();
         selectComposerContents(composer);
-
         document.execCommand("delete", false);
         setComposerTextFallback(composer, "");
         placeCaretAtEnd(composer);
@@ -657,18 +377,7 @@
         }
 
         composer.dispatchEvent(new Event("change", { bubbles: true }));
-        const actualText = normalizeComposerText(getComposerText(composer));
-        const expectedText = normalizeComposerText(text);
-        const matches = actualText === expectedText;
-        if (!matches) {
-            console.warn("[chatgpt-web-bridge] Composer text mismatch after typing.", {
-                expectedText,
-                actualText,
-                composerHtml: composer.innerHTML
-            });
-        }
-
-        return matches;
+        return normalizeComposerText(getComposerText(composer)) === normalizeComposerText(text);
     }
 
     async function submitPrompt(composer) {
@@ -679,63 +388,6 @@
         }
 
         return triggerEnterFallback(composer);
-    }
-
-    function findSendButton() {
-        const form = document.querySelector("form");
-        if (!form) {
-            return null;
-        }
-
-        const explicit = form.querySelector(
-            "button[data-testid='send-button'], button[aria-label*='Отправ'], button[aria-label*='Send'], button[aria-label*='Submit']"
-        );
-        if (isEnabledSubmitCandidate(explicit)) {
-            return explicit;
-        }
-
-        const submitStyled = form.querySelector("button.composer-submit-button-color");
-        if (!isEnabledSubmitCandidate(submitStyled)) {
-            return null;
-        }
-
-        const label = `${submitStyled.getAttribute("aria-label") || ""}`.toLowerCase();
-        const isVoice = label.includes("голос") || label.includes("voice");
-        return isVoice ? null : submitStyled;
-    }
-
-    function isEnabledSubmitCandidate(button) {
-        if (!(button instanceof HTMLButtonElement)) {
-            return false;
-        }
-
-        if (button.disabled) {
-            return false;
-        }
-
-        const style = window.getComputedStyle(button);
-        if (style.display === "none" || style.visibility === "hidden") {
-            return false;
-        }
-
-        const rect = button.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    }
-
-    function triggerEnterFallback(composer) {
-        const eventOptions = {
-            bubbles: true,
-            cancelable: true,
-            key: "Enter",
-            code: "Enter",
-            which: 13,
-            keyCode: 13
-        };
-
-        composer.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
-        composer.dispatchEvent(new KeyboardEvent("keypress", eventOptions));
-        composer.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
-        return true;
     }
 
     async function waitForSendFeedback(composer) {
@@ -766,22 +418,16 @@
 
     async function ensureTemporaryChatMode(timeoutMs) {
         if (isTemporaryChatEnabled()) {
-            console.info("[chatgpt-web-bridge] Temporary chat is already enabled.", location.href);
             return true;
         }
 
         const button = await waitFor(findTemporaryChatEnableButton, timeoutMs);
         if (!(button instanceof HTMLButtonElement)) {
-            console.warn("[chatgpt-web-bridge] Temporary chat toggle button was not found.");
             return false;
         }
 
-        console.info("[chatgpt-web-bridge] Enabling temporary chat mode.");
         button.click();
         const enabled = await waitFor(() => (isTemporaryChatEnabled() ? true : null), timeoutMs);
-        if (enabled) {
-            console.info("[chatgpt-web-bridge] Temporary chat mode enabled.", location.href);
-        }
         return Boolean(enabled);
     }
 
@@ -811,8 +457,7 @@
         try {
             const parsedUrl = new URL(url, CHATGPT_HOME_URL);
             return parsedUrl.searchParams.get(TEMPORARY_CHAT_QUERY_PARAM) === "true";
-        } catch (error) {
-            console.warn("[chatgpt-web-bridge] Failed to parse temporary chat URL.", url, error);
+        } catch {
             return false;
         }
     }
@@ -834,43 +479,6 @@
         return `${value}`.replace(/\s+/g, " ").trim().toLowerCase();
     }
 
-    function getBridgeBaseUrlFromUrl(url) {
-        const portValue = readLaunchParam(url, BRIDGE_PORT_QUERY_PARAM);
-        if (!portValue || !/^\d+$/.test(portValue)) {
-            return null;
-        }
-
-        const port = Number.parseInt(portValue, 10);
-        if (!Number.isInteger(port) || port < 1 || port > 65535) {
-            return null;
-        }
-
-        return `http://127.0.0.1:${port}`;
-    }
-
-    function readLaunchParam(url, key) {
-        const queryValue = url.searchParams.get(key);
-        if (queryValue) {
-            return queryValue;
-        }
-
-        const hash = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
-        if (!hash) {
-            return null;
-        }
-
-        return new URLSearchParams(hash).get(key);
-    }
-
-    function normalizeNullableString(value) {
-        if (typeof value !== "string") {
-            return null;
-        }
-
-        const trimmed = value.trim();
-        return trimmed || null;
-    }
-
     async function waitForAssistantResponse(previousSnapshot, timeoutMs) {
         const deadline = Date.now() + timeoutMs;
         let latestSnapshot = null;
@@ -882,11 +490,7 @@
             const hasNewAssistantContent = isNewAssistantSnapshot(previousSnapshot, currentSnapshot);
 
             if (hasNewAssistantContent) {
-                if (
-                    !latestSnapshot ||
-                    latestSnapshot.key !== currentSnapshot.key ||
-                    latestSnapshot.text !== currentSnapshot.text
-                ) {
+                if (!latestSnapshot || latestSnapshot.key !== currentSnapshot.key || latestSnapshot.text !== currentSnapshot.text) {
                     latestSnapshot = currentSnapshot;
                     stableSince = Date.now();
                 } else if (!generationInProgress && latestSnapshot.text && Date.now() - stableSince >= RESPONSE_STABLE_MS) {
@@ -960,18 +564,11 @@
     }
 
     function normalizeAssistantMessageText(text) {
-        return `${text || ""}`
-            .replace(/\u200B/g, "")
-            .replace(/\r\n?/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim();
+        return `${text || ""}`.replace(/\u200B/g, "").replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
     }
 
     function getElementKey(element) {
-        const explicitKey =
-            element.getAttribute("data-message-id") ||
-            element.getAttribute("data-testid") ||
-            element.getAttribute("id");
+        const explicitKey = element.getAttribute("data-message-id") || element.getAttribute("data-testid") || element.getAttribute("id");
         if (explicitKey) {
             return explicitKey;
         }
@@ -1000,8 +597,8 @@
         let insertedByExecCommand = false;
         try {
             insertedByExecCommand = document.execCommand("insertText", false, char);
-        } catch (error) {
-            console.warn("[chatgpt-web-bridge] execCommand(insertText) threw.", error);
+        } catch {
+            insertedByExecCommand = false;
         }
 
         const afterExecCommandText = normalizeComposerText(getComposerText(composer));
@@ -1077,7 +674,6 @@
     function setComposerTextFallback(composer, text) {
         const paragraph = ensureComposerParagraph(composer);
         paragraph.replaceChildren();
-
         if (text) {
             paragraph.appendChild(document.createTextNode(text));
         } else {
@@ -1132,6 +728,58 @@
         return char.toUpperCase().charCodeAt(0);
     }
 
+    function findSendButton() {
+        const form = document.querySelector("form");
+        if (!form) {
+            return null;
+        }
+
+        const explicit = form.querySelector(
+            "button[data-testid='send-button'], button[aria-label*='Отправ'], button[aria-label*='Send'], button[aria-label*='Submit']"
+        );
+        if (isEnabledSubmitCandidate(explicit)) {
+            return explicit;
+        }
+
+        const submitStyled = form.querySelector("button.composer-submit-button-color");
+        if (!isEnabledSubmitCandidate(submitStyled)) {
+            return null;
+        }
+
+        const label = `${submitStyled.getAttribute("aria-label") || ""}`.toLowerCase();
+        return label.includes("голос") || label.includes("voice") ? null : submitStyled;
+    }
+
+    function isEnabledSubmitCandidate(button) {
+        if (!(button instanceof HTMLButtonElement) || button.disabled) {
+            return false;
+        }
+
+        const style = window.getComputedStyle(button);
+        if (style.display === "none" || style.visibility === "hidden") {
+            return false;
+        }
+
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function triggerEnterFallback(composer) {
+        const eventOptions = {
+            bubbles: true,
+            cancelable: true,
+            key: "Enter",
+            code: "Enter",
+            which: 13,
+            keyCode: 13
+        };
+
+        composer.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
+        composer.dispatchEvent(new KeyboardEvent("keypress", eventOptions));
+        composer.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
+        return true;
+    }
+
     function getTypingDelay(char) {
         let delay = randomBetween(TYPING_DELAY_MIN_MS, TYPING_DELAY_MAX_MS);
         if (char === " " || char === "\n" || char === "\t") {
@@ -1146,9 +794,7 @@
     }
 
     function findGenerationStopButton() {
-        return document.querySelector(
-            "button[aria-label*='Stop'], button[aria-label*='Останов'], button[data-testid*='stop']"
-        );
+        return document.querySelector("button[aria-label*='Stop'], button[aria-label*='Останов'], button[data-testid*='stop']");
     }
 
     function getPreSubmitDelay() {
