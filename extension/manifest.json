@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Web Bridge MVP",
+  "version": "0.1.0",
+  "description": "Локальный bridge для отправки промптов в ChatGPT Web через выделенную вкладку Firefox.",
+  "permissions": ["tabs", "storage", "nativeMessaging"],
+  "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Открыть automation-вкладку ChatGPT"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "chatgpt-web-bridge@example.local",
+      "strict_min_version": "121.0"
+    }
+  }
+}
