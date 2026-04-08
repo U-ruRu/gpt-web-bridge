@@ -12,7 +12,8 @@
     "scripts": ["background.js"]
   },
   "action": {
-    "default_title": "Открыть automation-вкладку ChatGPT"
+    "default_title": "ChatGPT Web Bridge",
+    "default_popup": "popup.html"
   },
   "options_ui": {
     "page": "options.html",

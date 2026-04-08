@@ -222,6 +222,16 @@
                 throw new Error("ChatGPT did not acknowledge the send action in time.");
             }
 
+            const acceptedResult = await browser.runtime.sendMessage({
+                type: "reportJobAccepted",
+                commandId: job.commandId,
+                detail: "Prompt was sent.",
+                conversationUrl: extractConversationUrl(location.href) || metadata.conversationUrl || undefined
+            });
+            if (!acceptedResult?.ok) {
+                throw new Error(acceptedResult?.error || "The browser agent did not confirm the prompt dispatch.");
+            }
+
             const conversationUrl =
                 (await waitForConversationUrl(5000)) ||
                 extractConversationUrl(location.href) ||

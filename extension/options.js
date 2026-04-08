@@ -2,6 +2,7 @@ const form = document.querySelector("#settings-form");
 const serverUrlInput = document.querySelector("#server-url");
 const serverAccessTokenInput = document.querySelector("#server-access-token");
 const userTokenInput = document.querySelector("#user-token");
+const parallelChatsModeInput = document.querySelector("#parallel-chats-mode");
 const statusNode = document.querySelector("#status");
 const STATUS_REFRESH_INTERVAL_MS = 1000;
 
@@ -17,6 +18,7 @@ async function initialize() {
         serverUrlInput.value = config.serverUrl || "";
         serverAccessTokenInput.value = config.serverAccessToken || "";
         userTokenInput.value = config.userToken || "";
+        parallelChatsModeInput.value = config.parallelChatsMode || "sequential_safe_timeout";
     }
 
     await refreshStatus();
@@ -28,7 +30,8 @@ async function initialize() {
             config: {
                 serverUrl: serverUrlInput.value,
                 serverAccessToken: serverAccessTokenInput.value,
-                userToken: userTokenInput.value
+                userToken: userTokenInput.value,
+                parallelChatsMode: parallelChatsModeInput.value
             }
         });
         await refreshStatus();

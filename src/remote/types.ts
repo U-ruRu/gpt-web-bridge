@@ -1,28 +1,37 @@
 import type { ChatMode } from "../bridge/types.js";
 
 export type AgentConnectionStatus = "connecting" | "ready" | "closed";
-export type RemoteSessionStatus = "starting" | "ready" | "busy" | "released";
+export type RemoteSessionState = "starting" | "ready" | "sending" | "waiting_response";
 
 export interface McpBindingRecord {
     mcpSessionId: string;
     userId: string;
-    defaultSessionToken: string | null;
-    ownedSessionTokens: Set<string>;
+    defaultChat: number | null;
     createdAt: string;
     updatedAt: string;
 }
 
+export interface RemotePendingOutcome {
+    status: "completed" | "failed";
+    response: string | null;
+    detail: string | null;
+    conversationUrl: string | null;
+    mode: ChatMode;
+}
+
 export interface RemoteSessionRecord {
-    sessionToken: string;
+    internalSessionKey: string;
+    chat: number;
     userId: string;
-    ownerMcpSessionId: string;
-    status: RemoteSessionStatus;
+    state: RemoteSessionState;
     mode: ChatMode;
     detail: string | null;
     conversationUrl: string | null;
     tabId: number | null;
     createdAt: string;
     updatedAt: string;
+    activeCommandId: string | null;
+    pendingOutcome: RemotePendingOutcome | null;
 }
 
 export interface AgentHelloMessage {
@@ -87,6 +96,15 @@ export interface AgentSessionCommandResultMessage {
     mode?: ChatMode;
 }
 
+export interface AgentSessionAskAcceptedMessage {
+    type: "session.askAccepted";
+    commandId: string;
+    sessionToken: string;
+    detail?: string | null;
+    conversationUrl?: string | null;
+    mode?: ChatMode;
+}
+
 export interface AgentSessionAskResultMessage {
     type: "session.askResult";
     commandId: string;
@@ -111,6 +129,7 @@ export type AgentToServerMessage =
     | AgentSessionReadyMessage
     | AgentSessionReleasedMessage
     | AgentSessionCommandResultMessage
+    | AgentSessionAskAcceptedMessage
     | AgentSessionAskResultMessage
     | AgentSessionErrorMessage;
 
@@ -162,27 +181,33 @@ export interface ConnectedAgentRecord {
     close(code?: number, reason?: string): void;
 }
 
-export interface RemoteSessionView {
-    sessionToken: string;
-    status: RemoteSessionStatus;
-    mode: ChatMode;
-    detail: string | null;
-    conversationUrl: string | null;
-    tabId: number | null;
-    createdAt: string;
-    updatedAt: string;
+export interface RemoteNewChatResult {
+    chat: number;
+}
+
+export interface RemoteAskAsyncResult {
+    chat: number;
 }
 
 export interface RemoteAskResult {
-    sessionToken: string;
-    responseText: string;
-    conversationUrl: string | null;
-    detail: string | null;
-    mode: ChatMode;
+    response: string;
 }
 
-export interface RemoteCommandResult {
-    sessionToken: string;
-    detail: string | null;
-    mode: ChatMode;
+export interface RemoteAwaitResponseResult {
+    response: string;
+}
+
+export interface RemoteReleaseResult {
+    ok: true;
+}
+
+export interface RemoteSessionSummary {
+    chat: number;
+    state: RemoteSessionState;
+    temporary: boolean;
+}
+
+export interface RemoteSessionInfoResult {
+    defaultChat: number | null;
+    chats: RemoteSessionSummary[];
 }

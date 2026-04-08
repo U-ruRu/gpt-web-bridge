@@ -19,7 +19,7 @@
 - поднимает MCP endpoint на `/mcp` через `Streamable HTTP`;
 - принимает browser-agent на `/agent/ws`;
 - связывает агент и MCP-клиентов по общему `user token`;
-- изолирует chat session'ы по `sessionToken`;
+- изолирует пользовательские чаты по простым номерам `chat`;
 - открывает новую вкладку ChatGPT на каждый `new_chat`;
 - поддерживает несколько параллельных MCP-сессий одного пользователя;
 - позволяет работать как через `localhost`, так и через tunnel/public URL.
@@ -73,21 +73,23 @@ npm run start:server -- --host=127.0.0.1 --port=8787 --server-access-token=repla
 
 ## MCP tools
 
-Сервер регистрирует 5 инструментов:
+Сервер регистрирует 6 инструментов:
 
 - `chatgpt_web.new_chat`
 - `chatgpt_web.ask`
-- `chatgpt_web.set_temporary`
-- `chatgpt_web.release_session`
+- `chatgpt_web.ask_async`
+- `chatgpt_web.await_response`
+- `chatgpt_web.release_chat`
 - `chatgpt_web.session_info`
 
 Коротко:
 
-- `new_chat` создает новую вкладку и новую chat session;
-- `ask` отправляет запрос в уже привязанную session;
-- `set_temporary` переводит текущую session во временный режим;
-- `session_info` возвращает состояние привязанной session;
-- `release_session` освобождает session и закрывает вкладку.
+- `new_chat` создает новую вкладку и возвращает номер нового чата;
+- `ask` отправляет запрос и ждет полный ответ;
+- `ask_async` отправляет запрос и возвращается после фактической отправки prompt;
+- `await_response` ждет финальный ответ для чата;
+- `session_info` возвращает `defaultChat` и список активных чатов;
+- `release_chat` освобождает чат и закрывает вкладку.
 
 Подробности и примеры есть в [инструкции по использованию](./docs/USAGE.md#mcp-tools).
 
@@ -101,8 +103,9 @@ npm run start:server -- --host=127.0.0.1 --port=8787 --server-access-token=repla
 Изоляция работает так:
 
 - один `user token` видит только своего browser-agent;
-- одна MCP transport session владеет только своими `sessionToken`;
-- две параллельные MCP-сессии одного пользователя не пишут в одни и те же вкладки, если не используют один и тот же `sessionToken`.
+- чаты нумеруются как `1`, `2`, `3` и уникальны в рамках пользователя;
+- один чат не принимает второй запрос, пока не завершен предыдущий цикл `ask_async/await_response` или `ask`;
+- один `user token` может использовать несколько чатов параллельно, а режим отправки управляется настройкой `Parallel Chats` в расширении.
 
 ## Расширение и установка одним файлом
 

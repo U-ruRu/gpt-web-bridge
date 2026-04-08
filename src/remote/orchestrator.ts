@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { CHATGPT_HOME_URL, HttpError } from "../bridge/types.js";
 import type {
+    AgentSessionAskAcceptedMessage,
     AgentSessionAskResultMessage,
     AgentSessionCommandResultMessage,
     AgentSessionReadyMessage,
@@ -8,37 +9,56 @@ import type {
     AgentToServerMessage,
     ConnectedAgentRecord,
     McpBindingRecord,
+    RemoteAskAsyncResult,
     RemoteAskResult,
-    RemoteCommandResult,
+    RemoteAwaitResponseResult,
+    RemoteNewChatResult,
+    RemoteReleaseResult,
+    RemoteSessionInfoResult,
     RemoteSessionRecord,
-    RemoteSessionView,
+    RemoteSessionSummary,
     ServerToAgentMessage
 } from "./types.js";
 
 interface RemoteOrchestratorOptions {
     serverAccessToken: string;
     defaultCommandTimeoutMs?: number;
+    defaultResponseTimeoutMs?: number;
 }
 
 interface PendingCommand<T> {
     resolve(value: T): void;
     reject(error: Error): void;
     timeout: NodeJS.Timeout;
+    onReject?(error: Error): void;
 }
 
+interface PendingResponseWaiter {
+    resolve(value: RemoteAwaitResponseResult): void;
+    reject(error: Error): void;
+    timeout: NodeJS.Timeout;
+}
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 120000;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 180000;
+const TEMPORARY_MODE_DELAY_MS = 3000;
 const now = () => new Date().toISOString();
 
 export class RemoteOrchestrator {
     private readonly serverAccessToken: string;
     private readonly defaultCommandTimeoutMs: number;
+    private readonly defaultResponseTimeoutMs: number;
     private readonly connectedAgents = new Map<string, ConnectedAgentRecord>();
     private readonly sessions = new Map<string, RemoteSessionRecord>();
+    private readonly userChats = new Map<string, Map<number, string>>();
     private readonly mcpBindings = new Map<string, McpBindingRecord>();
     private readonly pendingCommands = new Map<string, PendingCommand<unknown>>();
+    private readonly responseWaiters = new Map<string, PendingResponseWaiter[]>();
 
     constructor(options: RemoteOrchestratorOptions) {
         this.serverAccessToken = options.serverAccessToken.trim();
-        this.defaultCommandTimeoutMs = options.defaultCommandTimeoutMs ?? 120000;
+        this.defaultCommandTimeoutMs = options.defaultCommandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+        this.defaultResponseTimeoutMs = options.defaultResponseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     }
 
     getHealthView() {
@@ -46,7 +66,7 @@ export class RemoteOrchestrator {
             ok: true,
             connectedAgents: this.connectedAgents.size,
             activeMcpSessions: this.mcpBindings.size,
-            activeChatSessions: [...this.sessions.values()].filter((entry) => entry.status !== "released").length
+            activeChatSessions: this.sessions.size
         };
     }
 
@@ -80,8 +100,7 @@ export class RemoteOrchestrator {
         const binding: McpBindingRecord = {
             mcpSessionId,
             userId,
-            defaultSessionToken: null,
-            ownedSessionTokens: new Set<string>(),
+            defaultChat: null,
             createdAt: timestamp,
             updatedAt: timestamp
         };
@@ -90,23 +109,7 @@ export class RemoteOrchestrator {
     }
 
     closeMcpBinding(mcpSessionId: string) {
-        const binding = this.mcpBindings.get(mcpSessionId);
-        if (!binding) {
-            return;
-        }
-
         this.mcpBindings.delete(mcpSessionId);
-        for (const sessionToken of binding.ownedSessionTokens) {
-            const session = this.sessions.get(sessionToken);
-            if (!session) {
-                continue;
-            }
-
-            session.status = "released";
-            session.updatedAt = now();
-            void this.tryReleaseSessionOnAgent(binding.userId, sessionToken);
-            this.sessions.delete(sessionToken);
-        }
     }
 
     registerAgent(hello: Extract<AgentToServerMessage, { type: "agent.hello" }>, agent: ConnectedAgentRecord) {
@@ -138,113 +141,160 @@ export class RemoteOrchestrator {
         this.connectedAgents.delete(userId);
     }
 
-    async newChat(userId: string, mcpSessionId: string, requestedSessionToken?: string | null) {
+    async newChat(userId: string, mcpSessionId: string, temporary = true): Promise<RemoteNewChatResult> {
         const binding = this.ensureMcpBinding(mcpSessionId, userId);
-        const sessionToken = this.allocateSessionToken(binding, requestedSessionToken);
+        const chat = this.allocateChatNumber(userId);
+        const internalSessionKey = randomUUID();
         const timestamp = now();
         const session: RemoteSessionRecord = {
-            sessionToken,
+            internalSessionKey,
+            chat,
             userId,
-            ownerMcpSessionId: mcpSessionId,
-            status: "starting",
+            state: "starting",
             mode: "normal",
             detail: "Waiting for the browser agent to open a fresh chat tab.",
             conversationUrl: null,
             tabId: null,
             createdAt: timestamp,
-            updatedAt: timestamp
+            updatedAt: timestamp,
+            activeCommandId: null,
+            pendingOutcome: null
         };
-        this.sessions.set(sessionToken, session);
-        binding.defaultSessionToken = sessionToken;
-        binding.ownedSessionTokens.add(sessionToken);
+
+        this.sessions.set(internalSessionKey, session);
+        this.getUserChatMap(userId).set(chat, internalSessionKey);
+        binding.defaultChat = chat;
         binding.updatedAt = timestamp;
 
-        const ready = await this.issueCommand<AgentSessionReadyMessage>(userId, {
-            type: "session.start",
-            sessionToken,
-            targetUrl: CHATGPT_HOME_URL,
-            openInTemporaryMode: false
-        });
+        try {
+            const ready = await this.issueCommand<AgentSessionReadyMessage>(userId, {
+                type: "session.start",
+                sessionToken: internalSessionKey,
+                targetUrl: CHATGPT_HOME_URL,
+                openInTemporaryMode: false
+            });
 
-        session.status = "ready";
-        session.detail = ready.detail ?? "Chat session is ready.";
-        session.conversationUrl = ready.conversationUrl ?? null;
-        session.mode = ready.mode ?? "normal";
-        session.tabId = ready.tabId ?? null;
-        session.updatedAt = now();
+            session.state = "ready";
+            session.detail = ready.detail ?? "Chat session is ready.";
+            session.conversationUrl = ready.conversationUrl ?? null;
+            session.mode = ready.mode ?? "normal";
+            session.tabId = ready.tabId ?? null;
+            session.updatedAt = now();
 
-        return this.toSessionView(session);
+            if (temporary) {
+                await sleep(TEMPORARY_MODE_DELAY_MS);
+                const temporaryResult = await this.issueCommand<AgentSessionCommandResultMessage>(userId, {
+                    type: "session.setTemporary",
+                    sessionToken: internalSessionKey
+                });
+                session.mode = temporaryResult.mode ?? "temporary";
+                session.detail = temporaryResult.detail ?? "Temporary chat mode is enabled.";
+                session.updatedAt = now();
+            }
+
+            return {
+                chat
+            };
+        } catch (error) {
+            await this.tryReleaseSessionOnAgent(userId, internalSessionKey);
+            this.removeSession(userId, chat, internalSessionKey);
+            if (binding.defaultChat === chat) {
+                binding.defaultChat = null;
+                binding.updatedAt = now();
+            }
+            throw error;
+        }
     }
 
-    async ask(userId: string, mcpSessionId: string, requestText: string, requestedSessionToken?: string | null) {
-        const session = this.resolveOwnedSession(userId, mcpSessionId, requestedSessionToken);
-        session.status = "busy";
+    async ask(userId: string, mcpSessionId: string, requestText: string, requestedChat?: number | null): Promise<RemoteAskResult> {
+        const result = await this.askAsync(userId, mcpSessionId, requestText, requestedChat);
+        return await this.awaitResponse(userId, mcpSessionId, result.chat);
+    }
+
+    async askAsync(
+        userId: string,
+        mcpSessionId: string,
+        requestText: string,
+        requestedChat?: number | null
+    ): Promise<RemoteAskAsyncResult> {
+        const session = this.resolveChatSession(userId, mcpSessionId, requestedChat);
+        if (session.state !== "ready" || session.pendingOutcome) {
+            throw new HttpError(409, "The requested chat already has an active request.");
+        }
+
+        session.state = "sending";
         session.detail = "Waiting for the browser agent to send the prompt.";
         session.updatedAt = now();
+        session.pendingOutcome = null;
 
-        const result = await this.issueCommand<AgentSessionAskResultMessage>(userId, {
-            type: "session.ask",
-            sessionToken: session.sessionToken,
-            request: requestText
-        });
-
-        session.status = "ready";
-        session.detail = result.detail ?? "Assistant response captured.";
-        session.conversationUrl = result.conversationUrl ?? session.conversationUrl;
-        session.mode = result.mode ?? session.mode;
-        session.updatedAt = now();
-
-        const response: RemoteAskResult = {
-            sessionToken: session.sessionToken,
-            responseText: result.responseText,
-            conversationUrl: session.conversationUrl,
-            detail: session.detail,
-            mode: session.mode
+        await this.issueAskAccepted(userId, session, requestText);
+        return {
+            chat: session.chat
         };
-        return response;
     }
 
-    async setTemporary(userId: string, mcpSessionId: string, requestedSessionToken?: string | null) {
-        const session = this.resolveOwnedSession(userId, mcpSessionId, requestedSessionToken);
-        const result = await this.issueCommand<AgentSessionCommandResultMessage>(userId, {
-            type: "session.setTemporary",
-            sessionToken: session.sessionToken
-        });
-
-        session.mode = result.mode ?? "temporary";
-        session.detail = result.detail ?? "Temporary chat mode is enabled.";
-        session.updatedAt = now();
-
-        const response: RemoteCommandResult = {
-            sessionToken: session.sessionToken,
-            detail: session.detail,
-            mode: session.mode
-        };
-        return response;
-    }
-
-    async releaseSession(userId: string, mcpSessionId: string, requestedSessionToken?: string | null) {
-        const binding = this.ensureMcpBinding(mcpSessionId, userId);
-        const session = this.resolveOwnedSession(userId, mcpSessionId, requestedSessionToken);
-        await this.tryReleaseSessionOnAgent(userId, session.sessionToken);
-        session.status = "released";
-        session.detail = "Session was released.";
-        session.updatedAt = now();
-        binding.ownedSessionTokens.delete(session.sessionToken);
-        if (binding.defaultSessionToken === session.sessionToken) {
-            binding.defaultSessionToken = null;
+    async awaitResponse(
+        userId: string,
+        mcpSessionId: string,
+        requestedChat?: number | null
+    ): Promise<RemoteAwaitResponseResult> {
+        const session = this.resolveChatSession(userId, mcpSessionId, requestedChat);
+        if (session.pendingOutcome) {
+            return this.consumePendingOutcome(session);
         }
-        this.sessions.delete(session.sessionToken);
+
+        if (session.state !== "sending" && session.state !== "waiting_response") {
+            throw new HttpError(409, "The requested chat does not have a pending response.");
+        }
+
+        return await new Promise<RemoteAwaitResponseResult>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.removeResponseWaiter(session.internalSessionKey, waiter);
+                reject(new HttpError(504, "Timed out while waiting for the ChatGPT response."));
+            }, this.defaultResponseTimeoutMs);
+
+            const waiter: PendingResponseWaiter = {
+                resolve,
+                reject,
+                timeout
+            };
+            const queue = this.responseWaiters.get(session.internalSessionKey) || [];
+            queue.push(waiter);
+            this.responseWaiters.set(session.internalSessionKey, queue);
+        });
+    }
+
+    async releaseChat(
+        userId: string,
+        mcpSessionId: string,
+        requestedChat?: number | null
+    ): Promise<RemoteReleaseResult> {
+        const session = this.resolveChatSession(userId, mcpSessionId, requestedChat);
+        if (session.state !== "ready" || session.pendingOutcome) {
+            throw new HttpError(409, "The requested chat has an unfinished request.");
+        }
+
+        await this.tryReleaseSessionOnAgent(userId, session.internalSessionKey);
+        this.removeSession(userId, session.chat, session.internalSessionKey);
+        this.clearReleasedChatDefaults(userId, session.chat);
 
         return {
-            ok: true,
-            sessionToken: session.sessionToken
+            ok: true
         };
     }
 
-    getSessionInfo(userId: string, mcpSessionId: string, requestedSessionToken?: string | null) {
-        const session = this.resolveOwnedSession(userId, mcpSessionId, requestedSessionToken);
-        return this.toSessionView(session);
+    getSessionInfo(userId: string, mcpSessionId: string): RemoteSessionInfoResult {
+        const binding = this.ensureMcpBinding(mcpSessionId, userId);
+        const chats = [...this.getUserChatMap(userId).entries()]
+            .sort((left, right) => left[0] - right[0])
+            .map(([, internalSessionKey]) => this.sessions.get(internalSessionKey))
+            .filter((session): session is RemoteSessionRecord => Boolean(session))
+            .map((session) => this.toSessionSummary(session));
+
+        return {
+            defaultChat: binding.defaultChat,
+            chats
+        };
     }
 
     handleAgentMessage(userId: string, message: AgentToServerMessage) {
@@ -261,8 +311,13 @@ export class RemoteOrchestrator {
             return;
         }
 
+        if (message.type === "session.askAccepted") {
+            this.handleAskAccepted(message);
+            return;
+        }
+
         if (message.type === "session.askResult") {
-            this.resolvePending(message.commandId, message);
+            this.handleAskResult(message);
             return;
         }
 
@@ -277,53 +332,49 @@ export class RemoteOrchestrator {
         }
 
         if (message.type === "session.error") {
-            this.rejectPending(message.commandId, new HttpError(502, message.detail));
+            this.handleSessionError(message);
         }
     }
 
-    private allocateSessionToken(binding: McpBindingRecord, requestedSessionToken?: string | null) {
-        const requested = requestedSessionToken?.trim() || randomUUID();
-        const existing = this.sessions.get(requested);
-        if (existing && existing.ownerMcpSessionId !== binding.mcpSessionId) {
-            throw new HttpError(409, "The requested session token is already owned by another MCP session.");
+    private allocateChatNumber(userId: string) {
+        const chats = this.getUserChatMap(userId);
+        let nextChat = 1;
+        while (chats.has(nextChat)) {
+            nextChat += 1;
         }
 
-        if (existing && existing.status !== "released") {
-            throw new HttpError(409, "The requested session token is already active.");
-        }
-
-        return requested;
+        return nextChat;
     }
 
-    private resolveOwnedSession(userId: string, mcpSessionId: string, requestedSessionToken?: string | null) {
+    private resolveChatSession(userId: string, mcpSessionId: string, requestedChat?: number | null) {
         const binding = this.ensureMcpBinding(mcpSessionId, userId);
-        const sessionToken = requestedSessionToken?.trim() || binding.defaultSessionToken;
-        if (!sessionToken) {
-            throw new HttpError(409, "No chat session is bound to the current MCP session.");
+        const chat = requestedChat ?? binding.defaultChat;
+        if (!chat) {
+            throw new HttpError(409, "No chat is bound to the current MCP session.");
         }
 
-        if (!binding.ownedSessionTokens.has(sessionToken)) {
-            throw new HttpError(403, "The requested session does not belong to this MCP session.");
+        const internalSessionKey = this.getUserChatMap(userId).get(chat);
+        if (!internalSessionKey) {
+            if (binding.defaultChat === chat) {
+                binding.defaultChat = null;
+                binding.updatedAt = now();
+            }
+            throw new HttpError(404, "The requested chat does not exist.");
         }
 
-        const session = this.sessions.get(sessionToken);
-        if (!session || session.status === "released") {
-            throw new HttpError(404, "The requested chat session does not exist.");
+        const session = this.sessions.get(internalSessionKey);
+        if (!session) {
+            throw new HttpError(404, "The requested chat does not exist.");
         }
 
         return session;
     }
 
-    private toSessionView(session: RemoteSessionRecord): RemoteSessionView {
+    private toSessionSummary(session: RemoteSessionRecord): RemoteSessionSummary {
         return {
-            sessionToken: session.sessionToken,
-            status: session.status,
-            mode: session.mode,
-            detail: session.detail,
-            conversationUrl: session.conversationUrl,
-            tabId: session.tabId,
-            createdAt: session.createdAt,
-            updatedAt: session.updatedAt
+            chat: session.chat,
+            state: session.state,
+            temporary: session.mode === "temporary"
         };
     }
 
@@ -336,7 +387,48 @@ export class RemoteOrchestrator {
         return agent;
     }
 
-    private async tryReleaseSessionOnAgent(userId: string, sessionToken: string) {
+    private getUserChatMap(userId: string) {
+        const existing = this.userChats.get(userId);
+        if (existing) {
+            return existing;
+        }
+
+        const created = new Map<number, string>();
+        this.userChats.set(userId, created);
+        return created;
+    }
+
+    private async issueAskAccepted(userId: string, session: RemoteSessionRecord, requestText: string) {
+        const onReject = (error: Error) => {
+            session.state = "ready";
+            session.activeCommandId = null;
+            session.detail = error.message;
+            session.updatedAt = now();
+            this.rejectResponseWaiters(session.internalSessionKey, error);
+        };
+
+        const result = await this.issueCommand<AgentSessionAskAcceptedMessage>(
+            userId,
+            {
+                type: "session.ask",
+                sessionToken: session.internalSessionKey,
+                request: requestText
+            },
+            this.defaultCommandTimeoutMs,
+            onReject,
+            (commandId) => {
+                session.activeCommandId = commandId;
+            }
+        );
+
+        session.state = "waiting_response";
+        session.detail = result.detail ?? "Prompt was sent.";
+        session.conversationUrl = result.conversationUrl ?? session.conversationUrl;
+        session.mode = result.mode ?? session.mode;
+        session.updatedAt = now();
+    }
+
+    private async tryReleaseSessionOnAgent(userId: string, internalSessionKey: string) {
         const agent = this.connectedAgents.get(userId);
         if (!agent || agent.status !== "ready") {
             return;
@@ -347,7 +439,7 @@ export class RemoteOrchestrator {
                 userId,
                 {
                     type: "session.release",
-                    sessionToken
+                    sessionToken: internalSessionKey
                 },
                 5000
             );
@@ -378,10 +470,14 @@ export class RemoteOrchestrator {
                 type: "session.release";
                 sessionToken: string;
             },
-        timeoutMs = this.defaultCommandTimeoutMs
+        timeoutMs = this.defaultCommandTimeoutMs,
+        onReject?: PendingCommand<T>["onReject"],
+        onCommandId?: (commandId: string) => void
     ) {
         const agent = this.getConnectedAgent(userId);
         const commandId = randomUUID();
+        onCommandId?.(commandId);
+
         const payload = {
             ...command,
             commandId
@@ -389,24 +485,145 @@ export class RemoteOrchestrator {
 
         return new Promise<T>((resolve, reject) => {
             const timeout = setTimeout(() => {
-                this.pendingCommands.delete(commandId);
-                reject(new HttpError(504, `Timed out while waiting for agent command ${command.type}.`));
+                this.failPending(commandId, new HttpError(504, `Timed out while waiting for agent command ${command.type}.`));
             }, timeoutMs);
 
             this.pendingCommands.set(commandId, {
                 resolve: resolve as PendingCommand<unknown>["resolve"],
                 reject,
-                timeout
+                timeout,
+                onReject: onReject as PendingCommand<unknown>["onReject"]
             });
 
             try {
                 agent.send(payload);
             } catch (error) {
-                clearTimeout(timeout);
-                this.pendingCommands.delete(commandId);
-                reject(error instanceof Error ? error : new Error(String(error)));
+                this.failPending(commandId, error instanceof Error ? error : new Error(String(error)));
             }
         });
+    }
+
+    private handleAskAccepted(message: AgentSessionAskAcceptedMessage) {
+        const session = this.sessions.get(message.sessionToken);
+        if (session && session.activeCommandId === message.commandId) {
+            session.state = "waiting_response";
+            session.detail = message.detail ?? "Prompt was sent.";
+            session.conversationUrl = message.conversationUrl ?? session.conversationUrl;
+            session.mode = message.mode ?? session.mode;
+            session.updatedAt = now();
+        }
+        this.resolvePending(message.commandId, message);
+    }
+
+    private handleAskResult(message: AgentSessionAskResultMessage) {
+        const session = this.sessions.get(message.sessionToken);
+        if (!session || session.activeCommandId !== message.commandId) {
+            return;
+        }
+
+        session.pendingOutcome = {
+            status: "completed",
+            response: message.responseText,
+            detail: message.detail ?? "Assistant response captured.",
+            conversationUrl: message.conversationUrl ?? session.conversationUrl,
+            mode: message.mode ?? session.mode
+        };
+        session.detail = session.pendingOutcome.detail;
+        session.conversationUrl = session.pendingOutcome.conversationUrl;
+        session.mode = session.pendingOutcome.mode;
+        session.state = "waiting_response";
+        session.activeCommandId = null;
+        session.updatedAt = now();
+        this.flushPendingOutcomeToWaiters(session);
+    }
+
+    private handleSessionError(message: Extract<AgentToServerMessage, { type: "session.error" }>) {
+        const pendingAsk = this.pendingCommands.get(message.commandId);
+        const session = this.sessions.get(message.sessionToken);
+        const error = new HttpError(502, message.detail);
+
+        if (pendingAsk) {
+            this.failPending(message.commandId, error);
+            return;
+        }
+
+        if (!session || session.activeCommandId !== message.commandId) {
+            return;
+        }
+
+        session.pendingOutcome = {
+            status: "failed",
+            response: null,
+            detail: message.detail,
+            conversationUrl: session.conversationUrl,
+            mode: session.mode
+        };
+        session.detail = message.detail;
+        session.state = "waiting_response";
+        session.activeCommandId = null;
+        session.updatedAt = now();
+        this.flushPendingOutcomeToWaiters(session);
+    }
+
+    private flushPendingOutcomeToWaiters(session: RemoteSessionRecord) {
+        const waiters = this.responseWaiters.get(session.internalSessionKey);
+        if (!waiters?.length || !session.pendingOutcome) {
+            return;
+        }
+
+        this.responseWaiters.delete(session.internalSessionKey);
+        const outcome = session.pendingOutcome;
+        session.pendingOutcome = null;
+        session.state = "ready";
+        session.updatedAt = now();
+
+        if (outcome.status === "failed") {
+            const error = new HttpError(502, outcome.detail || "The prompt execution failed.");
+            for (const waiter of waiters) {
+                clearTimeout(waiter.timeout);
+                waiter.reject(error);
+            }
+            return;
+        }
+
+        const result: RemoteAwaitResponseResult = {
+            response: outcome.response || ""
+        };
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timeout);
+            waiter.resolve(result);
+        }
+    }
+
+    private consumePendingOutcome(session: RemoteSessionRecord): RemoteAwaitResponseResult {
+        const outcome = session.pendingOutcome;
+        if (!outcome) {
+            throw new HttpError(409, "The requested chat does not have a pending response.");
+        }
+
+        session.pendingOutcome = null;
+        session.state = "ready";
+        session.updatedAt = now();
+
+        if (outcome.status === "failed") {
+            throw new HttpError(502, outcome.detail || "The prompt execution failed.");
+        }
+
+        return {
+            response: outcome.response || ""
+        };
+    }
+
+    private failPending(commandId: string, error: Error) {
+        const pending = this.pendingCommands.get(commandId);
+        if (!pending) {
+            return;
+        }
+
+        clearTimeout(pending.timeout);
+        this.pendingCommands.delete(commandId);
+        pending.onReject?.(error);
+        pending.reject(error);
     }
 
     private resolvePending(commandId: string, value: unknown) {
@@ -420,15 +637,55 @@ export class RemoteOrchestrator {
         pending.resolve(value);
     }
 
-    private rejectPending(commandId: string, error: Error) {
-        const pending = this.pendingCommands.get(commandId);
-        if (!pending) {
+    private rejectResponseWaiters(internalSessionKey: string, error: Error) {
+        const waiters = this.responseWaiters.get(internalSessionKey);
+        if (!waiters?.length) {
             return;
         }
 
-        clearTimeout(pending.timeout);
-        this.pendingCommands.delete(commandId);
-        pending.reject(error);
+        this.responseWaiters.delete(internalSessionKey);
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timeout);
+            waiter.reject(error);
+        }
+    }
+
+    private removeResponseWaiter(internalSessionKey: string, targetWaiter: PendingResponseWaiter) {
+        const waiters = this.responseWaiters.get(internalSessionKey);
+        if (!waiters?.length) {
+            return;
+        }
+
+        const nextWaiters = waiters.filter((waiter) => waiter !== targetWaiter);
+        if (nextWaiters.length === 0) {
+            this.responseWaiters.delete(internalSessionKey);
+            return;
+        }
+
+        this.responseWaiters.set(internalSessionKey, nextWaiters);
+    }
+
+    private clearReleasedChatDefaults(userId: string, chat: number) {
+        const timestamp = now();
+        for (const binding of this.mcpBindings.values()) {
+            if (binding.userId !== userId || binding.defaultChat !== chat) {
+                continue;
+            }
+
+            binding.defaultChat = null;
+            binding.updatedAt = timestamp;
+        }
+    }
+
+    private removeSession(userId: string, chat: number, internalSessionKey: string) {
+        this.sessions.delete(internalSessionKey);
+        this.responseWaiters.delete(internalSessionKey);
+
+        const chats = this.getUserChatMap(userId);
+        chats.delete(chat);
+        if (chats.size === 0) {
+            this.userChats.delete(userId);
+        }
     }
 }
 
@@ -451,4 +708,8 @@ export function createConnectedAgentRecord(
         send,
         close
     };
+}
+
+function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -6,11 +6,17 @@ const DEBUG_LOGS_KEY = "debugLogs";
 const DEBUG_LOG_LIMIT = 200;
 const RECONNECT_DELAY_MS = 3000;
 const CONNECT_TIMEOUT_MS = 10000;
+const PARALLEL_CHATS_DEFAULT_MODE = "sequential_safe_timeout";
+const SAFE_TIMEOUT_MIN_MS = 3000;
+const SAFE_TIMEOUT_MAX_MS = 10000;
 
 let agentSocket = null;
 let reconnectTimer = null;
 let connectTimeoutTimer = null;
 let connectionAttemptId = 0;
+let nextJobSequence = 1;
+let globalSendLock = null;
+let globalSendCooldownUntil = 0;
 let agentConnectionState = {
     status: "idle",
     detail: null,
@@ -23,15 +29,20 @@ let agentConnectionState = {
 const pendingLaunches = new Map();
 const pendingJobs = new Map();
 const pendingCommands = new Map();
+const dispatchedJobs = new Map();
 
 browser.action.onClicked.addListener(async () => {
+    await openAutomationWorkspace("browser-action");
+});
+
+async function openAutomationWorkspace(reason) {
     const config = await getAgentConfig();
     if (!config) {
         await browser.runtime.openOptionsPage();
         return;
     }
 
-    await connectAgentIfConfigured("browser-action");
+    await connectAgentIfConfigured(reason);
     const focused = await focusLastAutomationTab();
     if (!focused) {
         await browser.tabs.create({
@@ -39,7 +50,7 @@ browser.action.onClicked.addListener(async () => {
             active: true
         });
     }
-});
+}
 
 browser.runtime.onInstalled.addListener(async () => {
     await browser.storage.local.remove([AUTOMATION_TABS_KEY, LAST_AUTOMATION_TAB_ID_KEY, DEBUG_LOGS_KEY]);
@@ -67,6 +78,14 @@ browser.runtime.onMessage.addListener((message, sender) => {
 
     if (message?.type === "getAgentStatus") {
         return getAgentStatus();
+    }
+
+    if (message?.type === "openAutomationWorkspace") {
+        return openAutomationWorkspace("popup-open-chat");
+    }
+
+    if (message?.type === "openSettingsPage") {
+        return openSettingsPage();
     }
 
     if (message?.type === "isAutomationTab") {
@@ -99,6 +118,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
 
     if (message?.type === "reportJobResult") {
         return reportJobResult(sender, message);
+    }
+
+    if (message?.type === "reportJobAccepted") {
+        return reportJobAccepted(sender, message);
     }
 
     if (message?.type === "reportAutomationCommandResult") {
@@ -146,6 +169,7 @@ function normalizeAgentConfig(value) {
     const serverUrl = normalizeHttpServerUrl(value.serverUrl);
     const serverAccessToken = normalizeNullableString(value.serverAccessToken);
     const userToken = normalizeNullableString(value.userToken);
+    const parallelChatsMode = normalizeParallelChatsMode(value.parallelChatsMode) || PARALLEL_CHATS_DEFAULT_MODE;
     if (!serverUrl || !serverAccessToken || !userToken) {
         return null;
     }
@@ -153,7 +177,8 @@ function normalizeAgentConfig(value) {
     return {
         serverUrl,
         serverAccessToken,
-        userToken
+        userToken,
+        parallelChatsMode
     };
 }
 
@@ -281,6 +306,7 @@ async function connectAgentIfConfigured(reason) {
 function disconnectAgentSocket(detail) {
     clearReconnectTimer();
     clearConnectTimeoutTimer();
+    resetSchedulerState();
     connectionAttemptId += 1;
     if (agentSocket) {
         try {
@@ -468,8 +494,93 @@ async function queueSessionStart(message) {
 
 function queueSessionJob(sessionToken, job) {
     const queue = pendingJobs.get(sessionToken) || [];
-    queue.push(job);
+    queue.push({
+        ...job,
+        sequence: nextJobSequence++
+    });
     pendingJobs.set(sessionToken, queue);
+}
+
+function getParallelChatsMode(config) {
+    return normalizeParallelChatsMode(config?.parallelChatsMode) || PARALLEL_CHATS_DEFAULT_MODE;
+}
+
+function isSequentialParallelChatsMode(mode) {
+    return mode === "sequential" || mode === "sequential_safe_timeout";
+}
+
+function getNextQueuedJobEntry() {
+    let nextEntry = null;
+    for (const [sessionToken, queue] of pendingJobs.entries()) {
+        if (!Array.isArray(queue) || queue.length === 0) {
+            continue;
+        }
+
+        const candidate = queue[0];
+        if (!nextEntry || candidate.sequence < nextEntry.job.sequence) {
+            nextEntry = {
+                sessionToken,
+                job: candidate
+            };
+        }
+    }
+
+    return nextEntry;
+}
+
+function canDispatchQueuedJob(mode, sessionToken, job) {
+    if (mode === "parallel") {
+        return true;
+    }
+
+    if (!isSequentialParallelChatsMode(mode)) {
+        return true;
+    }
+
+    if (globalSendLock && globalSendLock.commandId !== job.commandId) {
+        return false;
+    }
+
+    if (Date.now() < globalSendCooldownUntil) {
+        return false;
+    }
+
+    const nextEntry = getNextQueuedJobEntry();
+    return Boolean(nextEntry && nextEntry.sessionToken === sessionToken && nextEntry.job.commandId === job.commandId);
+}
+
+function markJobDispatched(mode, sessionToken, job) {
+    dispatchedJobs.set(job.commandId, {
+        sessionToken,
+        accepted: false
+    });
+
+    if (isSequentialParallelChatsMode(mode)) {
+        globalSendLock = {
+            sessionToken,
+            commandId: job.commandId
+        };
+    }
+}
+
+function releaseDispatchGate(commandId, useSafeDelay) {
+    if (!globalSendLock || globalSendLock.commandId !== commandId) {
+        return;
+    }
+
+    globalSendLock = null;
+    if (useSafeDelay) {
+        globalSendCooldownUntil = Date.now() + randomBetween(SAFE_TIMEOUT_MIN_MS, SAFE_TIMEOUT_MAX_MS);
+        return;
+    }
+
+    globalSendCooldownUntil = 0;
+}
+
+function resetSchedulerState() {
+    globalSendLock = null;
+    globalSendCooldownUntil = 0;
+    dispatchedJobs.clear();
 }
 
 function queueSessionCommand(sessionToken, command) {
@@ -492,6 +603,16 @@ async function releaseSessionTab(sessionToken, commandId) {
     pendingJobs.delete(sessionToken);
     pendingCommands.delete(sessionToken);
     pendingLaunches.delete(sessionToken);
+    for (const [queuedCommandId, job] of dispatchedJobs.entries()) {
+        if (job.sessionToken !== sessionToken) {
+            continue;
+        }
+
+        if (globalSendLock?.commandId === queuedCommandId) {
+            releaseDispatchGate(queuedCommandId, false);
+        }
+        dispatchedJobs.delete(queuedCommandId);
+    }
     sendToAgent({
         type: "session.released",
         commandId,
@@ -505,6 +626,11 @@ async function getAgentStatus() {
         ...agentConnectionState,
         hasConfiguration: Boolean(await getAgentConfig())
     };
+}
+
+async function openSettingsPage() {
+    await browser.runtime.openOptionsPage();
+    return { ok: true };
 }
 
 async function isSenderAutomationTab(sender) {
@@ -579,8 +705,16 @@ async function getPendingJob(sender) {
         return null;
     }
 
-    const nextJob = queue.shift();
+    const config = await getAgentConfig();
+    const parallelChatsMode = getParallelChatsMode(config);
+    const nextJob = queue[0];
+    if (!canDispatchQueuedJob(parallelChatsMode, metadata.sessionToken, nextJob)) {
+        return null;
+    }
+
+    queue.shift();
     pendingJobs.set(metadata.sessionToken, queue);
+    markJobDispatched(parallelChatsMode, metadata.sessionToken, nextJob);
     return nextJob || null;
 }
 
@@ -650,6 +784,56 @@ async function reportSessionError(sender, message) {
     return { ok: true };
 }
 
+async function reportJobAccepted(sender, message) {
+    const metadata = await getSenderAutomationTabMetadata(sender);
+    if (!metadata?.sessionToken) {
+        return {
+            ok: false,
+            error: "The sender tab is not bound to a session."
+        };
+    }
+
+    const commandId = normalizeNullableString(message?.commandId);
+    if (!commandId) {
+        return {
+            ok: false,
+            error: "commandId is required."
+        };
+    }
+
+    const dispatchedJob = dispatchedJobs.get(commandId);
+    if (!dispatchedJob) {
+        return {
+            ok: false,
+            error: "The job is not tracked as dispatched."
+        };
+    }
+
+    const detail = normalizeNullableString(message?.detail) || "Prompt was sent.";
+    const conversationUrl = normalizeConversationUrl(message?.conversationUrl);
+    if (typeof sender.tab?.id === "number") {
+        await setAutomationTabMetadata(sender.tab.id, {
+            ...metadata,
+            conversationUrl: conversationUrl || metadata.conversationUrl
+        });
+    }
+
+    dispatchedJob.accepted = true;
+    dispatchedJobs.set(commandId, dispatchedJob);
+    const mode = getParallelChatsMode(await getAgentConfig());
+    releaseDispatchGate(commandId, mode === "sequential_safe_timeout");
+
+    sendToAgent({
+        type: "session.askAccepted",
+        commandId,
+        sessionToken: metadata.sessionToken,
+        detail,
+        conversationUrl: conversationUrl || null,
+        mode: metadata.isTemporary ? "temporary" : "normal"
+    });
+    return { ok: true };
+}
+
 async function reportJobResult(sender, message) {
     const metadata = await getSenderAutomationTabMetadata(sender);
     if (!metadata?.sessionToken) {
@@ -669,6 +853,7 @@ async function reportJobResult(sender, message) {
 
     const detail = normalizeNullableString(message?.detail);
     const conversationUrl = normalizeConversationUrl(message?.conversationUrl);
+    const dispatchedJob = dispatchedJobs.get(commandId) || null;
     if (typeof sender.tab?.id === "number") {
         await setAutomationTabMetadata(sender.tab.id, {
             ...metadata,
@@ -677,6 +862,10 @@ async function reportJobResult(sender, message) {
     }
 
     if (message?.status === "failed") {
+        if (dispatchedJob && !dispatchedJob.accepted) {
+            releaseDispatchGate(commandId, false);
+        }
+        dispatchedJobs.delete(commandId);
         sendToAgent({
             type: "session.error",
             commandId,
@@ -686,6 +875,22 @@ async function reportJobResult(sender, message) {
         return { ok: true };
     }
 
+    if (dispatchedJob && !dispatchedJob.accepted) {
+        dispatchedJob.accepted = true;
+        dispatchedJobs.set(commandId, dispatchedJob);
+        const mode = getParallelChatsMode(await getAgentConfig());
+        releaseDispatchGate(commandId, mode === "sequential_safe_timeout");
+        sendToAgent({
+            type: "session.askAccepted",
+            commandId,
+            sessionToken: metadata.sessionToken,
+            detail: "Prompt was sent.",
+            conversationUrl: conversationUrl || null,
+            mode: metadata.isTemporary ? "temporary" : "normal"
+        });
+    }
+
+    dispatchedJobs.delete(commandId);
     sendToAgent({
         type: "session.askResult",
         commandId,
@@ -891,6 +1096,14 @@ function formatSocketCloseDetail(event) {
     return "WebSocket connection is closed.";
 }
 
+function normalizeParallelChatsMode(value) {
+    if (value === "parallel" || value === "sequential" || value === "sequential_safe_timeout") {
+        return value;
+    }
+
+    return null;
+}
+
 function normalizeConversationUrl(value) {
     const normalized = normalizeNullableString(value);
     if (!normalized) {
@@ -907,6 +1120,10 @@ function normalizeConversationUrl(value) {
     } catch {
         return null;
     }
+}
+
+function randomBetween(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function normalizeNullableString(value) {

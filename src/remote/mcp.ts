@@ -7,27 +7,29 @@ interface RemoteMcpContext {
     mcpSessionId: string;
 }
 
+const chatSchema = z.number().int().positive().optional().describe("Optional chat number.");
+
 export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context: RemoteMcpContext) {
     const server = new McpServer({
         name: "chatgpt-web-bridge-remote",
-        version: "0.3.0"
+        version: "0.4.0"
     });
 
     server.registerTool(
         "chatgpt_web.new_chat",
         {
-            description: "Open a fresh ChatGPT web chat in the user's browser agent and bind it to the current session.",
+            description: "Open a fresh ChatGPT chat in the user's browser agent.",
             inputSchema: {
-                sessionToken: z.string().trim().min(1).optional().describe("Optional explicit chat session token.")
+                temporary: z.boolean().optional().describe("Open the new chat in temporary mode. Defaults to true.")
             }
         },
-        async ({ sessionToken }) => {
-            const result = await orchestrator.newChat(context.userId, context.mcpSessionId, sessionToken);
+        async ({ temporary }) => {
+            const result = await orchestrator.newChat(context.userId, context.mcpSessionId, temporary ?? true);
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Chat session ${result.sessionToken} is ready.`
+                        text: `${result.chat}`
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -38,19 +40,19 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     server.registerTool(
         "chatgpt_web.ask",
         {
-            description: "Send a prompt to a bound ChatGPT browser session and return the assistant text.",
+            description: "Send a prompt to a chat and wait for the assistant response.",
             inputSchema: {
                 request: z.string().trim().min(1).describe("The prompt text to send to ChatGPT."),
-                sessionToken: z.string().trim().min(1).optional().describe("Optional explicit chat session token.")
+                chat: chatSchema
             }
         },
-        async ({ request, sessionToken }) => {
-            const result = await orchestrator.ask(context.userId, context.mcpSessionId, request, sessionToken);
+        async ({ request, chat }) => {
+            const result = await orchestrator.ask(context.userId, context.mcpSessionId, request, chat);
             return {
                 content: [
                     {
                         type: "text",
-                        text: result.responseText
+                        text: result.response
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -59,20 +61,21 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     );
 
     server.registerTool(
-        "chatgpt_web.set_temporary",
+        "chatgpt_web.ask_async",
         {
-            description: "Switch a bound ChatGPT browser session into temporary chat mode.",
+            description: "Send a prompt to a chat and return after the prompt is accepted by ChatGPT.",
             inputSchema: {
-                sessionToken: z.string().trim().min(1).optional().describe("Optional explicit chat session token.")
+                request: z.string().trim().min(1).describe("The prompt text to send to ChatGPT."),
+                chat: chatSchema
             }
         },
-        async ({ sessionToken }) => {
-            const result = await orchestrator.setTemporary(context.userId, context.mcpSessionId, sessionToken);
+        async ({ request, chat }) => {
+            const result = await orchestrator.askAsync(context.userId, context.mcpSessionId, request, chat);
             return {
                 content: [
                     {
                         type: "text",
-                        text: result.detail || "Temporary chat mode is enabled."
+                        text: `${result.chat}`
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -81,20 +84,42 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     );
 
     server.registerTool(
-        "chatgpt_web.release_session",
+        "chatgpt_web.await_response",
         {
-            description: "Release a bound browser chat session and close its automation tab.",
+            description: "Wait for the assistant response for a chat that already has an active request.",
             inputSchema: {
-                sessionToken: z.string().trim().min(1).optional().describe("Optional explicit chat session token.")
+                chat: chatSchema
             }
         },
-        async ({ sessionToken }) => {
-            const result = await orchestrator.releaseSession(context.userId, context.mcpSessionId, sessionToken);
+        async ({ chat }) => {
+            const result = await orchestrator.awaitResponse(context.userId, context.mcpSessionId, chat);
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Session ${result.sessionToken} was released.`
+                        text: result.response
+                    }
+                ],
+                structuredContent: result as unknown as Record<string, unknown>
+            };
+        }
+    );
+
+    server.registerTool(
+        "chatgpt_web.release_chat",
+        {
+            description: "Release a chat and close its automation tab.",
+            inputSchema: {
+                chat: chatSchema
+            }
+        },
+        async ({ chat }) => {
+            const result = await orchestrator.releaseChat(context.userId, context.mcpSessionId, chat);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: "ok"
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -105,18 +130,15 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     server.registerTool(
         "chatgpt_web.session_info",
         {
-            description: "Return metadata about the currently bound browser chat session.",
-            inputSchema: {
-                sessionToken: z.string().trim().min(1).optional().describe("Optional explicit chat session token.")
-            }
+            description: "Return the default chat and the status of all active chats for the current user."
         },
-        async ({ sessionToken }) => {
-            const result = orchestrator.getSessionInfo(context.userId, context.mcpSessionId, sessionToken);
+        async () => {
+            const result = orchestrator.getSessionInfo(context.userId, context.mcpSessionId);
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Session ${result.sessionToken} is ${result.status}.`
+                        text: JSON.stringify(result)
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>

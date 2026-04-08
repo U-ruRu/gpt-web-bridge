@@ -214,8 +214,9 @@ npm run run:waterfox-dev
 2. Убедитесь, что клиент видит инструменты:
    - `chatgpt_web.new_chat`
    - `chatgpt_web.ask`
-   - `chatgpt_web.set_temporary`
-   - `chatgpt_web.release_session`
+   - `chatgpt_web.ask_async`
+   - `chatgpt_web.await_response`
+   - `chatgpt_web.release_chat`
    - `chatgpt_web.session_info`
 3. Вызовите `chatgpt_web.new_chat`
 4. Убедитесь, что браузер открыл новую вкладку `chatgpt.com`
@@ -233,8 +234,8 @@ npm run run:waterfox-dev
 
 - расширение остается в статусе `ready`;
 - сервер не возвращает `401` или `503`;
-- `new_chat` создает новую вкладку;
-- `ask` возвращает `responseText`.
+- `new_chat` возвращает номер чата;
+- `ask` возвращает текст ответа.
 
 Программный пример подключения через Node.js SDK и описание session model вынесены в [инструкцию по использованию](./USAGE.md#настройка-mcp-клиента).
 
