@@ -166,6 +166,78 @@ npm run run:waterfox-dev
 
 Этот вариант тоже поддерживается без отдельной серверной ветки.
 
+## 7. Подключить MCP-клиент
+
+Для подключения MCP-клиента нужны:
+
+- MCP URL: `http://127.0.0.1:8787/mcp` или внешний URL вида `https://your-tunnel.example/mcp`
+- заголовок `Authorization: Bearer <server access token>`
+- заголовок `x-chatgpt-web-bridge-user-token: <user token>`
+
+Что важно:
+
+- `user token` в MCP-клиенте должен совпадать с `User Token` в настройках расширения;
+- `server access token` должен совпадать с токеном, с которым запущен сервер;
+- `mcp-session-id` вручную обычно задавать не нужно, transport управляет им сам.
+
+### Базовая схема подключения
+
+Если ваш MCP-клиент умеет подключаться к `Streamable HTTP` и позволяет указать URL и заголовки, конфигурация должна быть эквивалентна такой:
+
+```json
+{
+  "url": "http://127.0.0.1:8787/mcp",
+  "headers": {
+    "Authorization": "Bearer replace-me",
+    "x-chatgpt-web-bridge-user-token": "user-alpha"
+  }
+}
+```
+
+Если сервер доступен через tunnel, меняется только URL:
+
+```json
+{
+  "url": "https://your-tunnel.example/mcp",
+  "headers": {
+    "Authorization": "Bearer replace-me",
+    "x-chatgpt-web-bridge-user-token": "user-alpha"
+  }
+}
+```
+
+### Как проверить, что клиент подключился
+
+После добавления MCP-сервера в клиент:
+
+1. Перезапустите MCP-клиент или обновите список серверов
+2. Убедитесь, что клиент видит инструменты:
+   - `chatgpt_web.new_chat`
+   - `chatgpt_web.ask`
+   - `chatgpt_web.set_temporary`
+   - `chatgpt_web.release_session`
+   - `chatgpt_web.session_info`
+3. Вызовите `chatgpt_web.new_chat`
+4. Убедитесь, что браузер открыл новую вкладку `chatgpt.com`
+5. Вызовите `chatgpt_web.ask` с простым тестовым запросом
+
+Минимальный тестовый запрос:
+
+```json
+{
+  "request": "Ответь одной короткой фразой."
+}
+```
+
+Если все настроено правильно:
+
+- расширение остается в статусе `ready`;
+- сервер не возвращает `401` или `503`;
+- `new_chat` создает новую вкладку;
+- `ask` возвращает `responseText`.
+
+Программный пример подключения через Node.js SDK и описание session model вынесены в [инструкцию по использованию](./USAGE.md#настройка-mcp-клиента).
+
 ## После установки
 
 Следующий шаг: настроить MCP-клиент и начать работу с tool'ами. Это описано в [инструкции по использованию](./USAGE.md).

@@ -69,7 +69,7 @@ npm run start:server -- --host=127.0.0.1 --port=8787 --server-access-token=repla
 - `Authorization: Bearer replace-me`
 - `x-chatgpt-web-bridge-user-token: <ваш user token>`
 
-Полный пошаговый процесс описан в [инструкции по установке](./docs/INSTALL.md), а рабочий сценарий с tool'ами и сессиями описан в [инструкции по использованию](./docs/USAGE.md).
+Полный пошаговый процесс описан в [инструкции по установке](./docs/INSTALL.md), отдельный блок по подключению MCP-клиента находится [здесь](./docs/INSTALL.md#7-подключить-mcp-клиент), а рабочий сценарий с tool'ами и сессиями описан в [инструкции по использованию](./docs/USAGE.md).
 
 ## MCP tools
 
