@@ -24,7 +24,6 @@
 ## 1. Подготовить проект
 
 ```powershell
-cd D:\development\projects\chatgpt-web-bridge
 npm install
 npm run build
 ```
@@ -101,7 +100,7 @@ npm run build:addon:unsigned
 После этого появится unsigned `.xpi`:
 
 ```text
-D:\development\projects\chatgpt-web-bridge\artifacts\unsigned-addon\chatgpt-web-bridge-0.1.0-unsigned.xpi
+...\chatgpt-web-bridge\artifacts\unsigned-addon\chatgpt-web-bridge-0.1.0-unsigned.xpi
 ```
 
 Важно:

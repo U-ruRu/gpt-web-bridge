@@ -48,7 +48,6 @@ chatgpt.com
 1. Установите зависимости и соберите проект:
 
 ```powershell
-cd D:\development\projects\chatgpt-web-bridge
 npm install
 npm run build
 ```
