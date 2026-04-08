@@ -8,6 +8,7 @@ interface RemoteMcpContext {
 }
 
 const chatSchema = z.number().int().positive().optional().describe("Optional chat number.");
+const chatListSchema = z.array(z.number().int().positive()).min(1).optional().describe("Optional list of chat numbers.");
 
 export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context: RemoteMcpContext) {
     const server = new McpServer({
@@ -20,16 +21,17 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
         {
             description: "Open a fresh ChatGPT chat in the user's browser agent.",
             inputSchema: {
-                temporary: z.boolean().optional().describe("Open the new chat in temporary mode. Defaults to true.")
+                temporary: z.boolean().optional().describe("Open the new chat in temporary mode. Defaults to true."),
+                count: z.number().int().positive().optional().describe("How many chats to open. Defaults to 1.")
             }
         },
-        async ({ temporary }) => {
-            const result = await orchestrator.newChat(context.userId, context.mcpSessionId, temporary ?? true);
+        async ({ temporary, count }) => {
+            const result = await orchestrator.newChat(context.userId, context.mcpSessionId, temporary ?? true, count ?? 1);
             return {
                 content: [
                     {
                         type: "text",
-                        text: `${result.chat}`
+                        text: result.chat != null ? `${result.chat}` : JSON.stringify(result.chats || [])
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -110,11 +112,12 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
         {
             description: "Release a chat and close its automation tab.",
             inputSchema: {
-                chat: chatSchema
+                chat: chatSchema,
+                chats: chatListSchema
             }
         },
-        async ({ chat }) => {
-            const result = await orchestrator.releaseChat(context.userId, context.mcpSessionId, chat);
+        async ({ chat, chats }) => {
+            const result = await orchestrator.releaseChat(context.userId, context.mcpSessionId, chat, chats);
             return {
                 content: [
                     {

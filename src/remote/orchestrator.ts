@@ -141,7 +141,34 @@ export class RemoteOrchestrator {
         this.connectedAgents.delete(userId);
     }
 
-    async newChat(userId: string, mcpSessionId: string, temporary = true): Promise<RemoteNewChatResult> {
+    async newChat(
+        userId: string,
+        mcpSessionId: string,
+        temporary = true,
+        count = 1
+    ): Promise<RemoteNewChatResult> {
+        if (!Number.isInteger(count) || count < 1) {
+            throw new HttpError(400, "count must be a positive integer.");
+        }
+
+        const chats: number[] = [];
+        for (let index = 0; index < count; index += 1) {
+            const chat = await this.openSingleChat(userId, mcpSessionId, temporary);
+            chats.push(chat);
+        }
+
+        if (chats.length === 1) {
+            return {
+                chat: chats[0]
+            };
+        }
+
+        return {
+            chats
+        };
+    }
+
+    private async openSingleChat(userId: string, mcpSessionId: string, temporary = true): Promise<number> {
         const binding = this.ensureMcpBinding(mcpSessionId, userId);
         const chat = this.allocateChatNumber(userId);
         const internalSessionKey = randomUUID();
@@ -192,9 +219,7 @@ export class RemoteOrchestrator {
                 session.updatedAt = now();
             }
 
-            return {
-                chat
-            };
+            return chat;
         } catch (error) {
             await this.tryReleaseSessionOnAgent(userId, internalSessionKey);
             this.removeSession(userId, chat, internalSessionKey);
@@ -267,16 +292,25 @@ export class RemoteOrchestrator {
     async releaseChat(
         userId: string,
         mcpSessionId: string,
-        requestedChat?: number | null
+        requestedChat?: number | null,
+        requestedChats?: number[] | null
     ): Promise<RemoteReleaseResult> {
-        const session = this.resolveChatSession(userId, mcpSessionId, requestedChat);
-        if (session.state !== "ready" || session.pendingOutcome) {
-            throw new HttpError(409, "The requested chat has an unfinished request.");
+        const chats = this.resolveReleaseChats(userId, mcpSessionId, requestedChat, requestedChats);
+        const sessions = chats.map((chat) => this.resolveChatSession(userId, mcpSessionId, chat));
+        for (const session of sessions) {
+            if (session.state !== "ready" || session.pendingOutcome) {
+                throw new HttpError(409, "One of the requested chats has an unfinished request.");
+            }
         }
 
-        await this.tryReleaseSessionOnAgent(userId, session.internalSessionKey);
-        this.removeSession(userId, session.chat, session.internalSessionKey);
-        this.clearReleasedChatDefaults(userId, session.chat);
+        for (const session of sessions) {
+            await this.tryReleaseSessionOnAgent(userId, session.internalSessionKey);
+        }
+
+        for (const session of sessions) {
+            this.removeSession(userId, session.chat, session.internalSessionKey);
+            this.clearReleasedChatDefaults(userId, session.chat);
+        }
 
         return {
             ok: true
@@ -368,6 +402,34 @@ export class RemoteOrchestrator {
         }
 
         return session;
+    }
+
+    private resolveReleaseChats(
+        userId: string,
+        mcpSessionId: string,
+        requestedChat?: number | null,
+        requestedChats?: number[] | null
+    ) {
+        if (requestedChat != null && requestedChats?.length) {
+            throw new HttpError(400, "Use either chat or chats, not both.");
+        }
+
+        if (requestedChats?.length) {
+            const uniqueChats = [...new Set(requestedChats)];
+            if (uniqueChats.some((chat) => !Number.isInteger(chat) || chat < 1)) {
+                throw new HttpError(400, "chats must contain positive integers.");
+            }
+
+            return uniqueChats;
+        }
+
+        const binding = this.ensureMcpBinding(mcpSessionId, userId);
+        const fallbackChat = requestedChat ?? binding.defaultChat;
+        if (!fallbackChat) {
+            throw new HttpError(409, "No chat is bound to the current MCP session.");
+        }
+
+        return [fallbackChat];
     }
 
     private toSessionSummary(session: RemoteSessionRecord): RemoteSessionSummary {

@@ -182,7 +182,8 @@ export interface ConnectedAgentRecord {
 }
 
 export interface RemoteNewChatResult {
-    chat: number;
+    chat?: number;
+    chats?: number[];
 }
 
 export interface RemoteAskAsyncResult {
