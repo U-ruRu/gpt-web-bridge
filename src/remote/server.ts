@@ -23,6 +23,7 @@ interface McpSessionHandle {
     userId: string;
     server: ReturnType<typeof createRemoteMcpServer>;
     transport: StreamableHTTPServerTransport;
+    isDisposed: boolean;
 }
 
 const USER_TOKEN_HEADER = "x-chatgpt-web-bridge-user-token";
@@ -38,7 +39,7 @@ export function startRemoteServer(options: RemoteServerOptions): RemoteServerHan
         try {
             await routeRemoteRequest(orchestrator, mcpSessions, request, response);
         } catch (error) {
-            handleHttpError(response, error);
+            handleHttpError(response, request, error);
         }
     });
 
@@ -56,8 +57,11 @@ export function startRemoteServer(options: RemoteServerOptions): RemoteServerHan
             return;
         }
 
+        logServerEvent("agent", "WebSocket upgrade request received.", {
+            remoteAddress: request.socket.remoteAddress || null
+        });
         websocketServer.handleUpgrade(request, socket, head, (websocket) => {
-            wireAgentSocket(orchestrator, websocket);
+            wireAgentSocket(orchestrator, websocket, request.socket.remoteAddress || null);
         });
     });
 
@@ -85,11 +89,7 @@ export function startRemoteServer(options: RemoteServerOptions): RemoteServerHan
                         resolve();
                     });
                 }),
-                ...[...mcpSessions.values()].map(async (session) => {
-                    orchestrator.closeMcpBinding(session.sessionId);
-                    await session.server.close();
-                    await session.transport.close();
-                })
+                ...[...mcpSessions.values()].map((session) => disposeMcpSession(orchestrator, mcpSessions, session, true))
             ]);
         }
     };
@@ -159,11 +159,13 @@ async function routeRemoteRequest(
 
         handle = await createMcpSessionHandle(orchestrator, userId);
         mcpSessions.set(handle.sessionId, handle);
+        logServerEvent("mcp", "Created MCP transport session.", {
+            sessionId: handle.sessionId,
+            userId: maskIdentifier(userId)
+        });
         const createdHandle = handle;
         createdHandle.transport.onclose = () => {
-            mcpSessions.delete(createdHandle.sessionId);
-            orchestrator.closeMcpBinding(createdHandle.sessionId);
-            void createdHandle.server.close();
+            void disposeMcpSession(orchestrator, mcpSessions, createdHandle, false);
         };
     }
 
@@ -186,11 +188,38 @@ async function createMcpSessionHandle(orchestrator: RemoteOrchestrator, userId: 
         sessionId,
         userId,
         server,
-        transport
+        transport,
+        isDisposed: false
     };
 }
 
-function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket) {
+async function disposeMcpSession(
+    orchestrator: RemoteOrchestrator,
+    mcpSessions: Map<string, McpSessionHandle>,
+    session: McpSessionHandle,
+    closeServer: boolean
+) {
+    if (session.isDisposed) {
+        return;
+    }
+
+    session.isDisposed = true;
+    mcpSessions.delete(session.sessionId);
+    orchestrator.closeMcpBinding(session.sessionId);
+    logServerEvent("mcp", "Disposed MCP transport session.", {
+        sessionId: session.sessionId,
+        userId: maskIdentifier(session.userId),
+        closeServer
+    });
+
+    if (!closeServer) {
+        return;
+    }
+
+    await session.server.close();
+}
+
+function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket, remoteAddress: string | null) {
     let userId: string | null = null;
     let agentId: string | null = null;
     let ready = false;
@@ -212,6 +241,9 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket)
             const message = JSON.parse(payload.toString("utf8")) as AgentToServerMessage;
             if (!ready) {
                 if (message.type !== "agent.hello") {
+                    logServerEvent("agent", "Rejected agent socket because the first message was not agent.hello.", {
+                        remoteAddress
+                    });
                     forceClose(4000, "The first WebSocket message must be agent.hello.");
                     return;
                 }
@@ -231,6 +263,13 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket)
                 userId = registration.userId;
                 agentId = registration.agentId;
                 ready = true;
+                logServerEvent("agent", "Browser agent is ready.", {
+                    agentId: registration.agentId,
+                    userId: maskIdentifier(registration.userId),
+                    browserName: message.browserName || null,
+                    browserVersion: message.browserVersion || null,
+                    remoteAddress
+                });
                 sendMessage({
                     type: "agent.ready",
                     agentId: registration.agentId,
@@ -247,6 +286,12 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket)
             orchestrator.handleAgentMessage(userId, message);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            logServerEvent("agent", "Failed to process an agent WebSocket message.", {
+                error: message,
+                remoteAddress,
+                userId: userId ? maskIdentifier(userId) : null,
+                agentId
+            });
             sendMessage({
                 type: "agent.error",
                 message
@@ -258,12 +303,23 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket)
         if (ready && userId && agentId) {
             orchestrator.disconnectAgent(userId, agentId);
         }
+        logServerEvent("agent", "Browser agent socket closed.", {
+            agentId,
+            userId: userId ? maskIdentifier(userId) : null,
+            remoteAddress
+        });
     });
 
-    websocket.on("error", () => {
+    websocket.on("error", (error) => {
         if (ready && userId && agentId) {
             orchestrator.disconnectAgent(userId, agentId);
         }
+        logServerEvent("agent", "Browser agent socket failed.", {
+            agentId,
+            userId: userId ? maskIdentifier(userId) : null,
+            remoteAddress,
+            error: error.message
+        });
     });
 }
 
@@ -298,8 +354,15 @@ function readSessionIdHeader(request: IncomingMessage) {
     return sessionId || null;
 }
 
-function handleHttpError(response: ServerResponse, error: unknown) {
+function handleHttpError(response: ServerResponse, request: IncomingMessage, error: unknown) {
+    const requestPath = request.url || "/";
     if (error instanceof HttpError) {
+        logServerEvent("http", "Request failed with an HTTP error.", {
+            method: request.method || "UNKNOWN",
+            path: requestPath,
+            statusCode: error.statusCode,
+            message: error.message
+        });
         sendJson(response, error.statusCode, {
             ok: false,
             error: error.message,
@@ -308,6 +371,11 @@ function handleHttpError(response: ServerResponse, error: unknown) {
         return;
     }
 
+    logServerEvent("http", "Request failed with an unexpected error.", {
+        method: request.method || "UNKNOWN",
+        path: requestPath,
+        error: error instanceof Error ? error.message : String(error)
+    });
     sendJson(response, 500, {
         ok: false,
         error: error instanceof Error ? error.message : "Internal server error."
@@ -325,4 +393,17 @@ function addCorsHeaders(response: ServerResponse) {
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Headers", `authorization, content-type, mcp-session-id, ${USER_TOKEN_HEADER}`);
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+}
+
+function logServerEvent(scope: string, message: string, details?: Record<string, unknown>) {
+    const suffix = details ? ` ${JSON.stringify(details)}` : "";
+    console.error(`[${scope}] ${message}${suffix}`);
+}
+
+function maskIdentifier(value: string) {
+    if (value.length <= 12) {
+        return value;
+    }
+
+    return `${value.slice(0, 8)}...${value.slice(-4)}`;
 }

@@ -5,6 +5,9 @@
   "description": "Удаленный browser-agent для отправки промптов в ChatGPT Web через выделенные вкладки браузера.",
   "permissions": ["tabs", "storage"],
   "host_permissions": ["https://chatgpt.com/*", "http://*/*", "https://*/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:* https: wss:;"
+  },
   "background": {
     "scripts": ["background.js"]
   },

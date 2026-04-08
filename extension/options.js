@@ -3,6 +3,9 @@ const serverUrlInput = document.querySelector("#server-url");
 const serverAccessTokenInput = document.querySelector("#server-access-token");
 const userTokenInput = document.querySelector("#user-token");
 const statusNode = document.querySelector("#status");
+const STATUS_REFRESH_INTERVAL_MS = 1000;
+
+let statusRefreshTimer = null;
 
 void initialize();
 
@@ -17,6 +20,7 @@ async function initialize() {
     }
 
     await refreshStatus();
+    startStatusAutoRefresh();
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
         await browser.runtime.sendMessage({
@@ -28,6 +32,14 @@ async function initialize() {
             }
         });
         await refreshStatus();
+    });
+    window.addEventListener("focus", () => {
+        void refreshStatus();
+    });
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            void refreshStatus();
+        }
     });
 }
 
@@ -43,4 +55,14 @@ async function refreshStatus() {
         `userId: ${status?.userId || "-"}`,
         `configured: ${status?.hasConfiguration ? "yes" : "no"}`
     ].join("\n");
+}
+
+function startStatusAutoRefresh() {
+    if (statusRefreshTimer) {
+        return;
+    }
+
+    statusRefreshTimer = setInterval(() => {
+        void refreshStatus();
+    }, STATUS_REFRESH_INTERVAL_MS);
 }

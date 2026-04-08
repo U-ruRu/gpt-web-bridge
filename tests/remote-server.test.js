@@ -244,3 +244,68 @@ test("remote server isolates chat sessions across MCP transport sessions for the
     });
     assert.equal(releaseResult.structuredContent.sessionToken, firstSessionToken);
 });
+
+test("remote server stays alive after an MCP transport session closes", { timeout: 30000 }, async (t) => {
+    const serverAccessToken = "test-server-access-token";
+    const userToken = "user-alpha";
+    let stderrText = "";
+
+    const child = spawn(process.execPath, [
+        distEntryPath,
+        "--transport=server",
+        "--host=127.0.0.1",
+        "--port=0",
+        `--server-access-token=${serverAccessToken}`
+    ], {
+        cwd: projectDir,
+        stdio: ["ignore", "ignore", "pipe"]
+    });
+
+    child.stderr.on("data", (chunk) => {
+        stderrText += chunk.toString("utf8");
+    });
+
+    t.after(async () => {
+        child.kill();
+    });
+
+    const baseUrl = await waitFor(() => extractServerBaseUrl(stderrText), {
+        timeoutMs: 10000,
+        intervalMs: 100
+    });
+
+    const agent = createAgentClient(baseUrl, serverAccessToken, userToken);
+    t.after(async () => {
+        agent.socket.close();
+    });
+
+    await waitFor(() => {
+        return agent.receivedMessages.find((message) => message.type === "agent.ready") || null;
+    }, {
+        timeoutMs: 5000,
+        intervalMs: 50
+    });
+
+    const first = await createMcpClient(baseUrl, serverAccessToken, userToken);
+    await first.client.listTools();
+    await Promise.allSettled([
+        first.client.close(),
+        first.transport.close()
+    ]);
+
+    await waitFor(() => (child.exitCode === null ? true : null), {
+        timeoutMs: 5000,
+        intervalMs: 50
+    });
+
+    const second = await createMcpClient(baseUrl, serverAccessToken, userToken);
+    t.after(async () => {
+        await Promise.allSettled([
+            second.client.close(),
+            second.transport.close()
+        ]);
+    });
+
+    const tools = await second.client.listTools();
+    assert.ok(tools.tools.some((tool) => tool.name === "chatgpt_web.new_chat"));
+});

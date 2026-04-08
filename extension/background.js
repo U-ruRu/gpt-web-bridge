@@ -5,9 +5,11 @@ const LAST_AUTOMATION_TAB_ID_KEY = "lastAutomationTabId";
 const DEBUG_LOGS_KEY = "debugLogs";
 const DEBUG_LOG_LIMIT = 200;
 const RECONNECT_DELAY_MS = 3000;
+const CONNECT_TIMEOUT_MS = 10000;
 
 let agentSocket = null;
 let reconnectTimer = null;
+let connectTimeoutTimer = null;
 let connectionAttemptId = 0;
 let agentConnectionState = {
     status: "idle",
@@ -174,6 +176,7 @@ async function connectAgentIfConfigured(reason) {
     }
 
     clearReconnectTimer();
+    clearConnectTimeoutTimer();
     connectionAttemptId += 1;
     const attemptId = connectionAttemptId;
     const websocketUrl = toAgentWebSocketUrl(config.serverUrl);
@@ -191,13 +194,23 @@ async function connectAgentIfConfigured(reason) {
 
     const socket = new WebSocket(websocketUrl);
     agentSocket = socket;
+    startConnectTimeout(attemptId, socket, config.serverUrl);
 
-    socket.addEventListener("open", () => {
+    socket.addEventListener("open", async () => {
         if (attemptId !== connectionAttemptId) {
             socket.close();
             return;
         }
 
+        agentConnectionState = {
+            ...agentConnectionState,
+            status: "connecting",
+            detail: "WebSocket is open. Waiting for the server confirmation.",
+            connected: false
+        };
+        await appendDebugLog("background", "info", "WebSocket connection is open. Waiting for agent.ready.", {
+            serverUrl: config.serverUrl
+        });
         sendToAgent({
             type: "agent.hello",
             serverAccessToken: config.serverAccessToken,
@@ -221,20 +234,26 @@ async function connectAgentIfConfigured(reason) {
         }
     });
 
-    socket.addEventListener("close", async () => {
+    socket.addEventListener("close", async (event) => {
         if (attemptId !== connectionAttemptId) {
             return;
         }
 
+        clearConnectTimeoutTimer();
         agentSocket = null;
+        const closeDetail = formatSocketCloseDetail(event);
+        const shouldPreserveError = agentConnectionState.status === "error" && Boolean(agentConnectionState.detail);
         agentConnectionState = {
             ...agentConnectionState,
-            status: "disconnected",
-            detail: "WebSocket connection is closed.",
+            status: shouldPreserveError ? "error" : "disconnected",
+            detail: shouldPreserveError ? agentConnectionState.detail : closeDetail,
             connected: false
         };
         await appendDebugLog("background", "warn", "Browser agent disconnected.", {
-            serverUrl: config.serverUrl
+            serverUrl: config.serverUrl,
+            code: event.code,
+            reason: event.reason || null,
+            wasClean: Boolean(event.wasClean)
         });
         scheduleReconnect("socket-close");
     });
@@ -244,10 +263,11 @@ async function connectAgentIfConfigured(reason) {
             return;
         }
 
+        clearConnectTimeoutTimer();
         agentConnectionState = {
             ...agentConnectionState,
             status: "error",
-            detail: "Failed to connect the browser agent.",
+            detail: "Failed to open the browser-agent WebSocket. Check the server URL and whether the server is running.",
             connected: false
         };
         await appendDebugLog("background", "error", "WebSocket connection failed.", {
@@ -260,6 +280,7 @@ async function connectAgentIfConfigured(reason) {
 
 function disconnectAgentSocket(detail) {
     clearReconnectTimer();
+    clearConnectTimeoutTimer();
     connectionAttemptId += 1;
     if (agentSocket) {
         try {
@@ -294,6 +315,39 @@ function clearReconnectTimer() {
     }
 }
 
+function startConnectTimeout(attemptId, socket, serverUrl) {
+    clearConnectTimeoutTimer();
+    connectTimeoutTimer = setTimeout(() => {
+        if (attemptId !== connectionAttemptId || socket !== agentSocket || agentConnectionState.status === "ready") {
+            return;
+        }
+
+        agentConnectionState = {
+            ...agentConnectionState,
+            status: "error",
+            detail: "Timed out while waiting for the server response. Check the server URL, access token, and server logs.",
+            connected: false
+        };
+        void appendDebugLog("background", "error", "Timed out while waiting for agent.ready.", {
+            serverUrl,
+            timeoutMs: CONNECT_TIMEOUT_MS
+        });
+
+        try {
+            socket.close();
+        } catch {
+            // Ignore close failures for already-closed sockets.
+        }
+    }, CONNECT_TIMEOUT_MS);
+}
+
+function clearConnectTimeoutTimer() {
+    if (connectTimeoutTimer) {
+        clearTimeout(connectTimeoutTimer);
+        connectTimeoutTimer = null;
+    }
+}
+
 function sendToAgent(message) {
     if (!agentSocket || agentSocket.readyState !== WebSocket.OPEN) {
         throw new Error("The browser agent is not connected.");
@@ -304,6 +358,7 @@ function sendToAgent(message) {
 
 async function handleAgentMessage(message) {
     if (message?.type === "agent.ready") {
+        clearConnectTimeoutTimer();
         agentConnectionState = {
             status: "ready",
             detail: "Browser agent is connected.",
@@ -320,6 +375,7 @@ async function handleAgentMessage(message) {
     }
 
     if (message?.type === "agent.error") {
+        clearConnectTimeoutTimer();
         agentConnectionState = {
             ...agentConnectionState,
             status: "error",
@@ -819,6 +875,20 @@ function toAgentWebSocketUrl(serverUrl) {
     url.hash = "";
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     return url.toString();
+}
+
+function formatSocketCloseDetail(event) {
+    const code = typeof event?.code === "number" ? event.code : 0;
+    const reason = normalizeNullableString(event?.reason);
+    if (reason) {
+        return `WebSocket connection is closed (code ${code}: ${reason}).`;
+    }
+
+    if (code) {
+        return `WebSocket connection is closed (code ${code}).`;
+    }
+
+    return "WebSocket connection is closed.";
 }
 
 function normalizeConversationUrl(value) {

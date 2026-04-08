@@ -30,6 +30,11 @@ async function loadBackgroundHelpers() {
     return module.exports;
 }
 
+async function loadExtensionManifest() {
+    const manifestText = await readFile(join(projectDir, "extension", "manifest.json"), "utf8");
+    return JSON.parse(manifestText);
+}
+
 test("background normalizes a valid remote agent configuration", async () => {
     const { normalizeAgentConfig } = await loadBackgroundHelpers();
 
@@ -67,4 +72,16 @@ test("background derives the agent websocket URL from the configured server URL"
         toAgentWebSocketUrl("http://127.0.0.1:8787/api"),
         "ws://127.0.0.1:8787/api/agent/ws"
     );
+});
+
+test("extension manifest allows browser-agent websocket connections to localhost and secure remotes", async () => {
+    const manifest = await loadExtensionManifest();
+
+    const extensionPagesPolicy = manifest.content_security_policy?.extension_pages || "";
+    assert.match(extensionPagesPolicy, /connect-src/);
+    assert.match(extensionPagesPolicy, /ws:\/\/127\.0\.0\.1:\*/);
+    assert.match(extensionPagesPolicy, /http:\/\/127\.0\.0\.1:\*/);
+    assert.match(extensionPagesPolicy, /\bhttps:/);
+    assert.match(extensionPagesPolicy, /\bwss:/);
+    assert.doesNotMatch(extensionPagesPolicy, /upgrade-insecure-requests/);
 });
