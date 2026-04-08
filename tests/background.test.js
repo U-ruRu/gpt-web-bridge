@@ -13,6 +13,7 @@ async function loadBackgroundHelpers() {
     const toAgentWebSocketUrlMatch = source.match(/function toAgentWebSocketUrl\(serverUrl\) \{[\s\S]*?\n\}/);
     const normalizeNullableStringMatch = source.match(/function normalizeNullableString\(value\) \{[\s\S]*?\n\}/);
     const normalizeParallelChatsModeMatch = source.match(/function normalizeParallelChatsMode\(value\) \{[\s\S]*?\n\}/);
+    const normalizeTypingSpeedMultiplierMatch = source.match(/function normalizeTypingSpeedMultiplier\(value\) \{[\s\S]*?\n\}/);
     const isPlainObjectMatch = source.match(/function isPlainObject\(value\) \{[\s\S]*?\n\}/);
 
     assert.ok(normalizeAgentConfigMatch, "normalizeAgentConfig() should be declared in background.js");
@@ -20,6 +21,7 @@ async function loadBackgroundHelpers() {
     assert.ok(toAgentWebSocketUrlMatch, "toAgentWebSocketUrl() should be declared in background.js");
     assert.ok(normalizeNullableStringMatch, "normalizeNullableString() should be declared in background.js");
     assert.ok(normalizeParallelChatsModeMatch, "normalizeParallelChatsMode() should be declared in background.js");
+    assert.ok(normalizeTypingSpeedMultiplierMatch, "normalizeTypingSpeedMultiplier() should be declared in background.js");
     assert.ok(isPlainObjectMatch, "isPlainObject() should be declared in background.js");
 
     const module = { exports: {} };
@@ -28,13 +30,15 @@ async function loadBackgroundHelpers() {
         "exports",
         `"use strict";
         const PARALLEL_CHATS_DEFAULT_MODE = "sequential_safe_timeout";
+        const TYPING_SPEED_DEFAULT_MULTIPLIER = 4;
         ${normalizeNullableStringMatch[0]}
         ${normalizeParallelChatsModeMatch[0]}
+        ${normalizeTypingSpeedMultiplierMatch[0]}
         ${isPlainObjectMatch[0]}
         ${normalizeHttpServerUrlMatch[0]}
         ${normalizeAgentConfigMatch[0]}
         ${toAgentWebSocketUrlMatch[0]}
-        module.exports = { normalizeAgentConfig, normalizeParallelChatsMode, toAgentWebSocketUrl };`
+        module.exports = { normalizeAgentConfig, normalizeParallelChatsMode, normalizeTypingSpeedMultiplier, toAgentWebSocketUrl };`
     );
     factory(module, module.exports);
     return module.exports;
@@ -120,7 +124,7 @@ async function loadPopupHtml() {
 }
 
 test("background normalizes a valid remote agent configuration and defaults to safe sequential mode", async () => {
-    const { normalizeAgentConfig, normalizeParallelChatsMode } = await loadBackgroundHelpers();
+    const { normalizeAgentConfig, normalizeParallelChatsMode, normalizeTypingSpeedMultiplier } = await loadBackgroundHelpers();
 
     assert.deepEqual(
         normalizeAgentConfig({
@@ -132,7 +136,8 @@ test("background normalizes a valid remote agent configuration and defaults to s
             serverUrl: "https://bridge.example.com/api",
             serverAccessToken: "server-secret",
             userToken: "user-secret",
-            parallelChatsMode: "sequential_safe_timeout"
+            parallelChatsMode: "sequential_safe_timeout",
+            typingSpeedMultiplier: 4
         }
     );
 
@@ -141,17 +146,21 @@ test("background normalizes a valid remote agent configuration and defaults to s
             serverUrl: "https://bridge.example.com",
             serverAccessToken: "secret",
             userToken: "user",
-            parallelChatsMode: "parallel"
+            parallelChatsMode: "parallel",
+            typingSpeedMultiplier: "8"
         }),
         {
             serverUrl: "https://bridge.example.com",
             serverAccessToken: "secret",
             userToken: "user",
-            parallelChatsMode: "parallel"
+            parallelChatsMode: "parallel",
+            typingSpeedMultiplier: 8
         }
     );
 
     assert.equal(normalizeParallelChatsMode("unexpected"), null);
+    assert.equal(normalizeTypingSpeedMultiplier(" 2,5 "), 2.5);
+    assert.equal(normalizeTypingSpeedMultiplier(0), null);
     assert.equal(
         normalizeAgentConfig({
             serverUrl: "ftp://example.com",

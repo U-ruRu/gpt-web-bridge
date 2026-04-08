@@ -7,6 +7,7 @@ const DEBUG_LOG_LIMIT = 200;
 const RECONNECT_DELAY_MS = 3000;
 const CONNECT_TIMEOUT_MS = 10000;
 const PARALLEL_CHATS_DEFAULT_MODE = "sequential_safe_timeout";
+const TYPING_SPEED_DEFAULT_MULTIPLIER = 4;
 const SAFE_TIMEOUT_MIN_MS = 3000;
 const SAFE_TIMEOUT_MAX_MS = 10000;
 
@@ -170,6 +171,7 @@ function normalizeAgentConfig(value) {
     const serverAccessToken = normalizeNullableString(value.serverAccessToken);
     const userToken = normalizeNullableString(value.userToken);
     const parallelChatsMode = normalizeParallelChatsMode(value.parallelChatsMode) || PARALLEL_CHATS_DEFAULT_MODE;
+    const typingSpeedMultiplier = normalizeTypingSpeedMultiplier(value.typingSpeedMultiplier) || TYPING_SPEED_DEFAULT_MULTIPLIER;
     if (!serverUrl || !serverAccessToken || !userToken) {
         return null;
     }
@@ -178,7 +180,8 @@ function normalizeAgentConfig(value) {
         serverUrl,
         serverAccessToken,
         userToken,
-        parallelChatsMode
+        parallelChatsMode,
+        typingSpeedMultiplier
     };
 }
 
@@ -1102,6 +1105,23 @@ function normalizeParallelChatsMode(value) {
     }
 
     return null;
+}
+
+function normalizeTypingSpeedMultiplier(value) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        return Math.round(value * 100) / 100;
+    }
+
+    if (typeof value !== "string") {
+        return null;
+    }
+
+    const normalized = Number.parseFloat(value.trim().replace(",", "."));
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+        return null;
+    }
+
+    return Math.round(normalized * 100) / 100;
 }
 
 function normalizeConversationUrl(value) {

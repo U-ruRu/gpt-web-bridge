@@ -3,6 +3,7 @@ const serverUrlInput = document.querySelector("#server-url");
 const serverAccessTokenInput = document.querySelector("#server-access-token");
 const userTokenInput = document.querySelector("#user-token");
 const parallelChatsModeInput = document.querySelector("#parallel-chats-mode");
+const typingSpeedMultiplierInput = document.querySelector("#typing-speed-multiplier");
 const statusNode = document.querySelector("#status");
 const STATUS_REFRESH_INTERVAL_MS = 1000;
 
@@ -19,6 +20,7 @@ async function initialize() {
         serverAccessTokenInput.value = config.serverAccessToken || "";
         userTokenInput.value = config.userToken || "";
         parallelChatsModeInput.value = config.parallelChatsMode || "sequential_safe_timeout";
+        typingSpeedMultiplierInput.value = `${config.typingSpeedMultiplier || 4}`;
     }
 
     await refreshStatus();
@@ -31,7 +33,8 @@ async function initialize() {
                 serverUrl: serverUrlInput.value,
                 serverAccessToken: serverAccessTokenInput.value,
                 userToken: userTokenInput.value,
-                parallelChatsMode: parallelChatsModeInput.value
+                parallelChatsMode: parallelChatsModeInput.value,
+                typingSpeedMultiplier: typingSpeedMultiplierInput.value
             }
         });
         await refreshStatus();

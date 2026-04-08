@@ -8,10 +8,11 @@
     const RESPONSE_TIMEOUT_MS = 180000;
     const RESPONSE_STABLE_MS = 1800;
     const SESSION_URL_REGEX = /^https:\/\/chatgpt\.com\/c\/[^/?#]+/;
-    const TYPING_DELAY_MIN_MS = 45;
-    const TYPING_DELAY_MAX_MS = 170;
+    const TYPING_DELAY_BASE_MIN_MS = 45;
+    const TYPING_DELAY_BASE_MAX_MS = 170;
     const TYPING_DELAY_SPACE_BONUS_MS = 90;
     const TYPING_DELAY_PUNCTUATION_BONUS_MS = 140;
+    const DEFAULT_TYPING_SPEED_MULTIPLIER = 4;
     const PRE_SUBMIT_DELAY_MS = 1000;
     const PRE_SUBMIT_JITTER_MIN_MS = 180;
     const PRE_SUBMIT_JITTER_MAX_MS = 900;
@@ -205,7 +206,8 @@
             }
 
             clearComposer(composer);
-            const inserted = await insertPromptText(composer, job.request);
+            const typingSpeedMultiplier = await getTypingSpeedMultiplier();
+            const inserted = await insertPromptText(composer, job.request, typingSpeedMultiplier);
             if (!inserted) {
                 throw new Error("Failed to insert text into the ChatGPT composer.");
             }
@@ -376,18 +378,29 @@
         composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
     }
 
-    async function insertPromptText(composer, text) {
+    async function insertPromptText(composer, text, typingSpeedMultiplier) {
         for (const char of text) {
             const inserted = insertCharacter(composer, char);
             if (!inserted) {
                 return false;
             }
 
-            await sleep(getTypingDelay(char));
+            await sleep(getTypingDelay(char, typingSpeedMultiplier));
         }
 
         composer.dispatchEvent(new Event("change", { bubbles: true }));
         return normalizeComposerText(getComposerText(composer)) === normalizeComposerText(text);
+    }
+
+    async function getTypingSpeedMultiplier() {
+        try {
+            const config = await browser.runtime.sendMessage({
+                type: "loadAgentConfig"
+            });
+            return normalizeTypingSpeedMultiplier(config?.typingSpeedMultiplier) || DEFAULT_TYPING_SPEED_MULTIPLIER;
+        } catch {
+            return DEFAULT_TYPING_SPEED_MULTIPLIER;
+        }
     }
 
     async function submitPrompt(composer) {
@@ -790,8 +803,8 @@
         return true;
     }
 
-    function getTypingDelay(char) {
-        let delay = randomBetween(TYPING_DELAY_MIN_MS, TYPING_DELAY_MAX_MS);
+    function getTypingDelay(char, typingSpeedMultiplier = DEFAULT_TYPING_SPEED_MULTIPLIER) {
+        let delay = randomBetween(TYPING_DELAY_BASE_MIN_MS, TYPING_DELAY_BASE_MAX_MS);
         if (char === " " || char === "\n" || char === "\t") {
             delay += TYPING_DELAY_SPACE_BONUS_MS;
         }
@@ -800,7 +813,24 @@
             delay += TYPING_DELAY_PUNCTUATION_BONUS_MS;
         }
 
-        return delay;
+        return Math.max(1, Math.round(delay / normalizeTypingSpeedMultiplier(typingSpeedMultiplier)));
+    }
+
+    function normalizeTypingSpeedMultiplier(value) {
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+            return value;
+        }
+
+        if (typeof value !== "string") {
+            return DEFAULT_TYPING_SPEED_MULTIPLIER;
+        }
+
+        const normalized = Number.parseFloat(value.trim().replace(",", "."));
+        if (!Number.isFinite(normalized) || normalized <= 0) {
+            return DEFAULT_TYPING_SPEED_MULTIPLIER;
+        }
+
+        return normalized;
     }
 
     function findGenerationStopButton() {
