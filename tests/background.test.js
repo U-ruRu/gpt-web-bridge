@@ -14,6 +14,10 @@ async function loadBackgroundHelpers() {
     const normalizeNullableStringMatch = source.match(/function normalizeNullableString\(value\) \{[\s\S]*?\n\}/);
     const normalizeParallelChatsModeMatch = source.match(/function normalizeParallelChatsMode\(value\) \{[\s\S]*?\n\}/);
     const normalizeTypingSpeedMultiplierMatch = source.match(/function normalizeTypingSpeedMultiplier\(value\) \{[\s\S]*?\n\}/);
+    const normalizeTemporaryModeDelaySecondsMatch = source.match(/function normalizeTemporaryModeDelaySeconds\(value\) \{[\s\S]*?\n\}/);
+    const getTemporaryModeDelaySecondsMatch = source.match(/function getTemporaryModeDelaySeconds\(config\) \{[\s\S]*?\n\}/);
+    const createAgentHelloMessageMatch = source.match(/function createAgentHelloMessage\(config\) \{[\s\S]*?\n\}/);
+    const canForwardDebugLogToServerMatch = source.match(/function canForwardDebugLogToServer\(\) \{[\s\S]*?\n\}/);
     const isPlainObjectMatch = source.match(/function isPlainObject\(value\) \{[\s\S]*?\n\}/);
 
     assert.ok(normalizeAgentConfigMatch, "normalizeAgentConfig() should be declared in background.js");
@@ -22,6 +26,10 @@ async function loadBackgroundHelpers() {
     assert.ok(normalizeNullableStringMatch, "normalizeNullableString() should be declared in background.js");
     assert.ok(normalizeParallelChatsModeMatch, "normalizeParallelChatsMode() should be declared in background.js");
     assert.ok(normalizeTypingSpeedMultiplierMatch, "normalizeTypingSpeedMultiplier() should be declared in background.js");
+    assert.ok(normalizeTemporaryModeDelaySecondsMatch, "normalizeTemporaryModeDelaySeconds() should be declared in background.js");
+    assert.ok(getTemporaryModeDelaySecondsMatch, "getTemporaryModeDelaySeconds() should be declared in background.js");
+    assert.ok(createAgentHelloMessageMatch, "createAgentHelloMessage() should be declared in background.js");
+    assert.ok(canForwardDebugLogToServerMatch, "canForwardDebugLogToServer() should be declared in background.js");
     assert.ok(isPlainObjectMatch, "isPlainObject() should be declared in background.js");
 
     const module = { exports: {} };
@@ -31,14 +39,42 @@ async function loadBackgroundHelpers() {
         `"use strict";
         const PARALLEL_CHATS_DEFAULT_MODE = "sequential_safe_timeout";
         const TYPING_SPEED_DEFAULT_MULTIPLIER = 4;
+        const TEMPORARY_MODE_DELAY_DEFAULT_SECONDS = 5;
+        let agentSocket = null;
+        let agentConnectionState = {
+            status: "idle",
+            connected: false
+        };
+        const WebSocket = { OPEN: 1 };
         ${normalizeNullableStringMatch[0]}
         ${normalizeParallelChatsModeMatch[0]}
         ${normalizeTypingSpeedMultiplierMatch[0]}
+        ${normalizeTemporaryModeDelaySecondsMatch[0]}
         ${isPlainObjectMatch[0]}
         ${normalizeHttpServerUrlMatch[0]}
         ${normalizeAgentConfigMatch[0]}
+        ${getTemporaryModeDelaySecondsMatch[0]}
+        ${createAgentHelloMessageMatch[0]}
+        ${canForwardDebugLogToServerMatch[0]}
         ${toAgentWebSocketUrlMatch[0]}
-        module.exports = { normalizeAgentConfig, normalizeParallelChatsMode, normalizeTypingSpeedMultiplier, toAgentWebSocketUrl };`
+        function setAgentConnectionState(nextState) {
+            agentConnectionState = { ...agentConnectionState, ...nextState };
+        }
+        function setAgentSocket(nextSocket) {
+            agentSocket = nextSocket;
+        }
+        module.exports = {
+            normalizeAgentConfig,
+            normalizeParallelChatsMode,
+            normalizeTypingSpeedMultiplier,
+            normalizeTemporaryModeDelaySeconds,
+            getTemporaryModeDelaySeconds,
+            createAgentHelloMessage,
+            canForwardDebugLogToServer,
+            setAgentConnectionState,
+            setAgentSocket,
+            toAgentWebSocketUrl
+        };`
     );
     factory(module, module.exports);
     return module.exports;
@@ -123,8 +159,22 @@ async function loadPopupHtml() {
     return await readFile(join(projectDir, "extension", "popup.html"), "utf8");
 }
 
+async function loadOptionsHtml() {
+    return await readFile(join(projectDir, "extension", "options.html"), "utf8");
+}
+
 test("background normalizes a valid remote agent configuration and defaults to safe sequential mode", async () => {
-    const { normalizeAgentConfig, normalizeParallelChatsMode, normalizeTypingSpeedMultiplier } = await loadBackgroundHelpers();
+    const {
+        normalizeAgentConfig,
+        normalizeParallelChatsMode,
+        normalizeTypingSpeedMultiplier,
+        normalizeTemporaryModeDelaySeconds,
+        getTemporaryModeDelaySeconds,
+        createAgentHelloMessage,
+        canForwardDebugLogToServer,
+        setAgentConnectionState,
+        setAgentSocket
+    } = await loadBackgroundHelpers();
 
     assert.deepEqual(
         normalizeAgentConfig({
@@ -137,7 +187,8 @@ test("background normalizes a valid remote agent configuration and defaults to s
             serverAccessToken: "server-secret",
             userToken: "user-secret",
             parallelChatsMode: "sequential_safe_timeout",
-            typingSpeedMultiplier: 4
+            typingSpeedMultiplier: 4,
+            temporaryModeDelaySeconds: 5
         }
     );
 
@@ -147,20 +198,46 @@ test("background normalizes a valid remote agent configuration and defaults to s
             serverAccessToken: "secret",
             userToken: "user",
             parallelChatsMode: "parallel",
-            typingSpeedMultiplier: "8"
+            typingSpeedMultiplier: "8",
+            temporaryModeDelaySeconds: "0"
         }),
         {
             serverUrl: "https://bridge.example.com",
             serverAccessToken: "secret",
             userToken: "user",
             parallelChatsMode: "parallel",
-            typingSpeedMultiplier: 8
+            typingSpeedMultiplier: 8,
+            temporaryModeDelaySeconds: 0
         }
     );
 
     assert.equal(normalizeParallelChatsMode("unexpected"), null);
     assert.equal(normalizeTypingSpeedMultiplier(" 2,5 "), 2.5);
     assert.equal(normalizeTypingSpeedMultiplier(0), null);
+    assert.equal(normalizeTemporaryModeDelaySeconds(" 6 "), 6);
+    assert.equal(normalizeTemporaryModeDelaySeconds(-1), null);
+    assert.equal(getTemporaryModeDelaySeconds({ temporaryModeDelaySeconds: "0" }), 0);
+    assert.equal(getTemporaryModeDelaySeconds({ temporaryModeDelaySeconds: "2.6" }), 3);
+    assert.equal(getTemporaryModeDelaySeconds({ temporaryModeDelaySeconds: "invalid" }), 5);
+    assert.deepEqual(
+        createAgentHelloMessage({
+            serverAccessToken: "server-secret",
+            userToken: "user-secret",
+            temporaryModeDelaySeconds: "7"
+        }),
+        {
+            type: "agent.hello",
+            serverAccessToken: "server-secret",
+            userToken: "user-secret",
+            browserName: "firefox",
+            temporaryModeDelaySeconds: 7
+        }
+    );
+    setAgentSocket({ readyState: 1 });
+    setAgentConnectionState({ status: "connecting", connected: false });
+    assert.equal(canForwardDebugLogToServer(), false);
+    setAgentConnectionState({ status: "ready", connected: true });
+    assert.equal(canForwardDebugLogToServer(), true);
     assert.equal(
         normalizeAgentConfig({
             serverUrl: "ftp://example.com",
@@ -246,4 +323,14 @@ test("extension action exposes a popup with a visible settings button", async ()
     assert.equal(manifest.action?.default_popup, "popup.html");
     assert.match(popupHtml, /id="open-settings"/);
     assert.match(popupHtml, /Open Settings/);
+});
+
+test("options page exposes a temporary mode delay setting with a 5 second default", async () => {
+    const optionsHtml = await loadOptionsHtml();
+
+    assert.match(optionsHtml, /id="temporary-mode-delay-seconds"/);
+    assert.match(optionsHtml, /Temporary Mode Delay \(seconds\)/);
+    assert.match(optionsHtml, /value="5"/);
+    assert.match(optionsHtml, /min="0"/);
+    assert.match(optionsHtml, /step="1"/);
 });

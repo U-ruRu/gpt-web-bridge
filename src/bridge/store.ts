@@ -4,29 +4,38 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
     AskResult,
+    AskAsyncResult,
     AutomationCommandRecord,
     AutomationCommandStatus,
     AutomationCommandType,
     AutomationLaunchRecord,
     AutomationLaunchStatus,
+    AwaitResponseResult,
     CHATGPT_HOME_URL,
+    ChatStatusSummary,
     HISTORY_SIZE_LIMIT_BYTES,
     HistoryExchange,
     HttpError,
     JobRecord,
     JobStatusPatch,
     JobView,
+    MessageStatusSummary,
     NewChatResult,
     PersistedSessionState,
+    ResponseStatusResult,
     RuntimePaths,
     SessionRecord,
     SessionView,
     SetTemporaryResult
 } from "./types.js";
+import { PersistentMessageStore, type PersistedMessageRecord } from "../message-store.js";
 
 const DEFAULT_JOB_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_LAUNCH_WAIT_TIMEOUT_MS = 30000;
 const SESSION_LOG_FILE_SUFFIX = "-runtime.log";
+const STDIO_CHAT_NUMBER = 1;
+const DEFAULT_ETA_MIN_MS = 120000;
+const DEFAULT_ETA_MAX_MS = 300000;
 
 const now = () => new Date().toISOString();
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -68,6 +77,7 @@ export class ChatGptWebRuntime {
     private readonly sessionIdValue: string;
     private readonly paths: RuntimePaths;
     private readonly logger: RuntimeLogger;
+    private readonly messageStore: PersistentMessageStore;
     private readonly jobs = new Map<string, JobRecord>();
     private readonly automationLaunches = new Map<string, AutomationLaunchRecord>();
     private readonly automationCommands = new Map<string, AutomationCommandRecord>();
@@ -81,6 +91,7 @@ export class ChatGptWebRuntime {
         this.sessionIdValue = sessionId;
         this.paths = resolveRuntimePaths(options.dataRootDir);
         this.logger = options.logger ?? defaultLogger;
+        this.messageStore = new PersistentMessageStore(this.paths.dataRootDir, "stdio");
         const createdAt = now();
         this.session = {
             sessionId,
@@ -105,6 +116,12 @@ export class ChatGptWebRuntime {
         await mkdir(this.paths.sessionsDir, { recursive: true });
         await mkdir(this.paths.historyDir, { recursive: true });
         await mkdir(this.paths.logsDir, { recursive: true });
+        await this.messageStore.initialize({
+            failInFlightDetail: "The local bridge restarted before the response was captured."
+        });
+        await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+            temporary: this.session.mode === "temporary"
+        });
         await this.writeLog("info", "runtime", "Runtime initialized.", {
             sessionId: this.sessionIdValue,
             dataRootDir: this.paths.dataRootDir
@@ -224,22 +241,94 @@ export class ChatGptWebRuntime {
     }
 
     async ask(request: string, waitTimeoutMs = DEFAULT_JOB_WAIT_TIMEOUT_MS): Promise<AskResult> {
-        const job = this.queueJob(request);
+        const { job, message } = await this.createPromptJob(request);
         await this.writeLog("info", "runtime", "Queued ask request.", {
             sessionId: this.sessionIdValue,
             jobId: job.id,
+            message: message.message,
             textLength: request.length,
             waitTimeoutMs
         });
         const resolvedJob = await this.waitForJobResolution(job.id, waitTimeoutMs);
+        const resolvedMessage = await this.messageStore.getMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, message.message);
         return {
-            responseText: resolvedJob.responseText || "",
+            responseText: resolvedMessage?.responseText || resolvedJob.responseText || "",
             conversationUrl: resolvedJob.conversationUrl,
-            detail: resolvedJob.detail,
+            detail: resolvedMessage?.detail || resolvedJob.detail,
             jobId: resolvedJob.id,
             status: resolvedJob.status,
             mode: resolvedJob.mode,
             sessionId: this.sessionIdValue
+        };
+    }
+
+    async askAsync(request: string, requestedChat?: number | null): Promise<AskAsyncResult> {
+        this.assertSupportedChat(requestedChat);
+        const { message } = await this.createPromptJob(request);
+        const { etaMinMs, etaMaxMs } = await this.getEtaRange();
+        return {
+            chat: STDIO_CHAT_NUMBER,
+            message: message.message,
+            etaMinMs,
+            etaMaxMs
+        };
+    }
+
+    async awaitResponse(messageNumber: number, requestedChat?: number | null): Promise<AwaitResponseResult> {
+        this.assertSupportedChat(requestedChat);
+        const message = await this.messageStore.getMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, messageNumber);
+        if (!message) {
+            throw new HttpError(404, "The requested message does not exist.", {
+                chat: STDIO_CHAT_NUMBER,
+                message: messageNumber
+            });
+        }
+
+        if (message.status === "sending" || message.status === "pending") {
+            return {
+                status: "pending",
+                chat: STDIO_CHAT_NUMBER,
+                message: messageNumber,
+                elapsedMs: computeElapsedMs(message)
+            };
+        }
+
+        if (message.status === "failed") {
+            return {
+                status: "failed",
+                chat: STDIO_CHAT_NUMBER,
+                message: messageNumber,
+                detail: message.detail || "The prompt execution failed.",
+                elapsedMs: computeElapsedMs(message)
+            };
+        }
+
+        const readMessage = await this.messageStore.markMessageRead(this.sessionIdValue, STDIO_CHAT_NUMBER, messageNumber);
+        return {
+            status: "completed",
+            chat: STDIO_CHAT_NUMBER,
+            message: messageNumber,
+            response: readMessage.responseText || "",
+            read: readMessage.read
+        };
+    }
+
+    async getResponseStatus(): Promise<ResponseStatusResult> {
+        const chat = await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+            temporary: this.session.mode === "temporary"
+        });
+        const stats = await this.messageStore.getDurationStats(this.sessionIdValue);
+        return {
+            defaultChat: STDIO_CHAT_NUMBER,
+            averageGenerationMs: stats.averageGenerationMs,
+            chats: [
+                {
+                    chat: STDIO_CHAT_NUMBER,
+                    state: this.getCurrentChatState(chat.messages),
+                    temporary: this.session.mode === "temporary",
+                    messages: chat.messages.map((message) => toMessageStatusSummary(message))
+                }
+            ]
         };
     }
 
@@ -348,6 +437,7 @@ export class ChatGptWebRuntime {
         if (command.type === "set-temporary" && status === "completed") {
             this.session.mode = "temporary";
             this.session.updatedAt = command.updatedAt;
+            await this.messageStore.setChatTemporary(this.sessionIdValue, STDIO_CHAT_NUMBER, true);
             await this.persistSessionState();
         }
 
@@ -375,7 +465,9 @@ export class ChatGptWebRuntime {
             responseText: null,
             createdAt,
             updatedAt: createdAt,
-            claimedAt: null
+            claimedAt: null,
+            chat: null,
+            message: null
         };
 
         this.jobs.set(job.id, job);
@@ -386,6 +478,50 @@ export class ChatGptWebRuntime {
             conversationUrl: this.session.conversationUrl
         });
         return toJobView(job, this.session);
+    }
+
+    private async createPromptJob(text: string) {
+        const normalizedText = normalizeText(text);
+        const chat = await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+            temporary: this.session.mode === "temporary"
+        });
+        const activeMessage = chat.messages.find((message) => message.status === "sending" || message.status === "pending");
+        if (activeMessage) {
+            throw new HttpError(409, "The current chat already has an active request.", {
+                chat: STDIO_CHAT_NUMBER,
+                message: activeMessage.message
+            });
+        }
+
+        const message = await this.messageStore.createMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, normalizedText);
+        const createdAt = now();
+        const job: JobRecord = {
+            id: randomUUID(),
+            sessionId: this.sessionIdValue,
+            text: normalizedText,
+            status: "queued",
+            detail: null,
+            conversationUrl: this.session.conversationUrl,
+            responseText: null,
+            createdAt,
+            updatedAt: createdAt,
+            claimedAt: null,
+            chat: STDIO_CHAT_NUMBER,
+            message: message.message
+        };
+
+        this.jobs.set(job.id, job);
+        void this.writeLog("debug", "runtime", "Prompt job queued.", {
+            sessionId: this.sessionIdValue,
+            jobId: job.id,
+            message: message.message,
+            textLength: normalizedText.length,
+            conversationUrl: this.session.conversationUrl
+        });
+        return {
+            job: toJobView(job, this.session),
+            message
+        };
     }
 
     claimNextJob(sessionId: string): JobView | null {
@@ -429,6 +565,9 @@ export class ChatGptWebRuntime {
         if (patch.status === "running") {
             job.claimedAt = job.claimedAt ?? job.updatedAt;
             job.detail = patch.detail?.trim() || "Automation started processing the job.";
+            if (job.message != null) {
+                await this.messageStore.markMessageAccepted(this.sessionIdValue, STDIO_CHAT_NUMBER, job.message);
+            }
         }
 
         if (patch.conversationUrl) {
@@ -453,7 +592,26 @@ export class ChatGptWebRuntime {
                 await this.recordSuccessfulExchange(job.text, job.responseText, job.conversationUrl ?? this.session.conversationUrl);
             }
 
+            if (job.message != null) {
+                await this.messageStore.completeMessage(
+                    this.sessionIdValue,
+                    STDIO_CHAT_NUMBER,
+                    job.message,
+                    job.responseText || "",
+                    job.detail
+                );
+            }
+
             await this.persistSessionState();
+        }
+
+        if (patch.status === "failed" && job.message != null) {
+            await this.messageStore.failMessage(
+                this.sessionIdValue,
+                STDIO_CHAT_NUMBER,
+                job.message,
+                job.detail || "Unknown automation error."
+            );
         }
 
         await this.writeLog(patch.status === "failed" ? "error" : "info", "runtime", "Job status updated.", {
@@ -609,6 +767,35 @@ export class ChatGptWebRuntime {
         throw new HttpError(504, "Timed out while waiting for the automation command to finish.", {
             token,
             waitTimeoutMs
+        });
+    }
+
+    private async getEtaRange() {
+        const stats = await this.messageStore.getDurationStats(this.sessionIdValue);
+        return {
+            etaMinMs: stats.p50Ms ?? DEFAULT_ETA_MIN_MS,
+            etaMaxMs: stats.p90Ms ?? Math.max(stats.p50Ms ?? 0, DEFAULT_ETA_MAX_MS)
+        };
+    }
+
+    private getCurrentChatState(messages: PersistedMessageRecord[]): ChatStatusSummary["state"] {
+        const activeMessage = [...messages]
+            .sort((left, right) => right.message - left.message)
+            .find((message) => message.status === "sending" || message.status === "pending");
+        if (!activeMessage) {
+            return "ready";
+        }
+
+        return activeMessage.status === "sending" ? "sending" : "waiting_response";
+    }
+
+    private assertSupportedChat(requestedChat?: number | null) {
+        if (requestedChat == null || requestedChat === STDIO_CHAT_NUMBER) {
+            return;
+        }
+
+        throw new HttpError(404, "The requested chat does not exist.", {
+            chat: requestedChat
         });
     }
 
@@ -793,6 +980,7 @@ export class ChatGptWebRuntime {
         this.session.mode = "normal";
         this.session.updatedAt = now();
         this.pendingHistory.length = 0;
+        void this.messageStore.setChatTemporary(this.sessionIdValue, STDIO_CHAT_NUMBER, false);
     }
 
     private assertSessionId(sessionId: string) {
@@ -946,6 +1134,28 @@ function escapeLogValue(value: string) {
 
 function formatHistoryExchange(exchange: HistoryExchange) {
     return `Request: "${escapeLogValue(exchange.requestText)}"\nAnswer: "${escapeLogValue(exchange.responseText)}"\n`;
+}
+
+function toMessageStatusSummary(message: PersistedMessageRecord): MessageStatusSummary {
+    return {
+        message: message.message,
+        status: message.status,
+        read: message.read,
+        createdAt: message.createdAt,
+        completedAt: message.completedAt,
+        elapsedMs: computeElapsedMs(message),
+        generationMs: message.generationMs
+    };
+}
+
+function computeElapsedMs(message: PersistedMessageRecord) {
+    const endTimestamp = Date.parse(message.completedAt || now());
+    const startTimestamp = Date.parse(message.createdAt);
+    if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp)) {
+        return 0;
+    }
+
+    return Math.max(0, endTimestamp - startTimestamp);
 }
 
 function sanitizeFileSegment(value: string) {

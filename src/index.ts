@@ -14,6 +14,7 @@ interface CliOptions {
     sessionId: string;
     dataDir?: string;
     serverAccessToken: string;
+    fullLog: boolean;
 }
 
 void main();
@@ -24,7 +25,9 @@ async function main() {
         const remoteServerHandle = startRemoteServer({
             host: options.host,
             port: options.port,
-            serverAccessToken: options.serverAccessToken
+            serverAccessToken: options.serverAccessToken,
+            dataRootDir: options.dataDir,
+            fullLog: options.fullLog
         });
         const remoteAddress = await listenRemoteServer(remoteServerHandle.server, {
             host: options.host,
@@ -122,6 +125,11 @@ function parseCliOptions(args: string[]): CliOptions {
         options.get("server-access-token") ||
         process.env.CHATGPT_WEB_BRIDGE_SERVER_ACCESS_TOKEN ||
         "dev-server-access-token";
+    const fullLog = parseBooleanFlag(
+        options.get("full-log") ||
+        options.get("fulllog") ||
+        process.env.CHATGPT_WEB_BRIDGE_FULL_LOG
+    );
 
     return {
         transport,
@@ -129,7 +137,8 @@ function parseCliOptions(args: string[]): CliOptions {
         port,
         sessionId,
         dataDir,
-        serverAccessToken
+        serverAccessToken,
+        fullLog
     };
 }
 
@@ -160,6 +169,14 @@ function parsePort(rawValue: string | undefined, defaultValue: number) {
     }
 
     return port;
+}
+
+function parseBooleanFlag(rawValue: string | undefined) {
+    if (!rawValue) {
+        return false;
+    }
+
+    return /^(1|true|yes|on)$/i.test(rawValue.trim());
 }
 
 async function waitForProcessExit() {

@@ -16,6 +16,10 @@
     const PRE_SUBMIT_DELAY_MS = 1000;
     const PRE_SUBMIT_JITTER_MIN_MS = 180;
     const PRE_SUBMIT_JITTER_MAX_MS = 900;
+    const PROMPT_SUBMIT_MAX_ATTEMPTS = 2;
+    const PROMPT_RETRY_DELAY_MS = 1200;
+    const SEND_BUTTON_WAIT_MS = 5000;
+    const SEND_ACK_RETRY_WAIT_MS = 1500;
 
     let loopStarted = false;
     let currentJobId = null;
@@ -200,29 +204,13 @@
 
     async function executeJob(job, metadata) {
         try {
-            const composer = await waitForComposer(DEFAULT_WAIT_MS);
-            if (!composer) {
-                throw new Error("Composer was not found on the page.");
-            }
-
-            clearComposer(composer);
             const typingSpeedMultiplier = await getTypingSpeedMultiplier();
-            const inserted = await insertPromptText(composer, job.request, typingSpeedMultiplier);
-            if (!inserted) {
-                throw new Error("Failed to insert text into the ChatGPT composer.");
-            }
-
             const previousAssistantSnapshot = getLatestAssistantMessageSnapshot();
-            await sleep(getPreSubmitDelay());
-            const submitted = await submitPrompt(composer);
-            if (!submitted) {
-                throw new Error("Send button did not become available.");
-            }
-
-            const sent = await waitForSendFeedback(composer);
-            if (!sent) {
-                throw new Error("ChatGPT did not acknowledge the send action in time.");
-            }
+            await emitDiagnosticLog("info", "Starting prompt dispatch.", {
+                commandId: job.commandId,
+                textLength: job.request.length
+            });
+            await dispatchPromptWithRetry(job.request, typingSpeedMultiplier);
 
             const acceptedResult = await browser.runtime.sendMessage({
                 type: "reportJobAccepted",
@@ -245,6 +233,11 @@
                 throw new Error("Assistant response was not captured in time.");
             }
 
+            await emitDiagnosticLog("info", "Assistant response captured.", {
+                commandId: job.commandId,
+                responseLength: assistantResponse.text.length
+            });
+
             await browser.runtime.sendMessage({
                 type: "reportJobResult",
                 commandId: job.commandId,
@@ -254,6 +247,10 @@
                 responseText: assistantResponse.text
             });
         } catch (error) {
+            await emitDiagnosticLog("error", "Prompt execution failed.", {
+                commandId: job.commandId,
+                error: error instanceof Error ? error.message : String(error)
+            });
             await browser.runtime.sendMessage({
                 type: "reportJobResult",
                 commandId: job.commandId,
@@ -265,6 +262,75 @@
             currentJobId = null;
             await sleep(POLL_DELAY_MS);
         }
+    }
+
+    async function dispatchPromptWithRetry(requestText, typingSpeedMultiplier) {
+        let lastError = new Error("Failed to send the prompt.");
+        for (let attempt = 1; attempt <= PROMPT_SUBMIT_MAX_ATTEMPTS; attempt += 1) {
+            try {
+                const attemptStartedAt = Date.now();
+                const composer = await waitForComposer(DEFAULT_WAIT_MS);
+                if (!composer) {
+                    throw new Error("Composer was not found on the page.");
+                }
+                const immediateInsertion = shouldUseImmediatePromptInsertion();
+
+                await emitDiagnosticLog("debug", "Prompt dispatch attempt started.", {
+                    attempt,
+                    maxAttempts: PROMPT_SUBMIT_MAX_ATTEMPTS,
+                    textLength: requestText.length,
+                    immediateInsertion
+                });
+
+                clearComposer(composer);
+                const inserted = await insertPromptText(composer, requestText, typingSpeedMultiplier);
+                if (!inserted) {
+                    throw new Error("Failed to insert text into the ChatGPT composer.");
+                }
+
+                await emitDiagnosticLog("debug", "Prompt inserted into the composer.", {
+                    attempt,
+                    insertDurationMs: Date.now() - attemptStartedAt,
+                    composerLength: getComposerText(composer).length,
+                    immediateInsertion
+                });
+
+                await sleep(getPreSubmitDelay());
+                const submitStartedAt = Date.now();
+                const submitted = await submitPrompt(composer);
+                if (!submitted) {
+                    throw new Error("Send button did not become available.");
+                }
+
+                const sent = await waitForSendFeedback(composer);
+                if (!sent) {
+                    throw new Error("ChatGPT did not acknowledge the send action in time.");
+                }
+
+                await emitDiagnosticLog("info", "Prompt submit acknowledged by the UI.", {
+                    attempt,
+                    submitDurationMs: Date.now() - submitStartedAt,
+                    totalAttemptDurationMs: Date.now() - attemptStartedAt
+                });
+
+                return;
+            } catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                if (attempt >= PROMPT_SUBMIT_MAX_ATTEMPTS) {
+                    break;
+                }
+
+                await emitDiagnosticLog("warn", "Prompt dispatch attempt failed. Retrying.", {
+                    attempt,
+                    maxAttempts: PROMPT_SUBMIT_MAX_ATTEMPTS,
+                    error: lastError.message,
+                    textLength: requestText.length
+                });
+                await sleep(PROMPT_RETRY_DELAY_MS);
+            }
+        }
+
+        throw lastError;
     }
 
     async function isDedicatedAutomationTab() {
@@ -379,13 +445,16 @@
     }
 
     async function insertPromptText(composer, text, typingSpeedMultiplier) {
+        const immediateInsertion = shouldUseImmediatePromptInsertion();
         for (const char of text) {
             const inserted = insertCharacter(composer, char);
             if (!inserted) {
                 return false;
             }
 
-            await sleep(getTypingDelay(char, typingSpeedMultiplier));
+            if (!immediateInsertion) {
+                await sleep(getTypingDelay(char, typingSpeedMultiplier));
+            }
         }
 
         composer.dispatchEvent(new Event("change", { bubbles: true }));
@@ -404,10 +473,27 @@
     }
 
     async function submitPrompt(composer) {
-        const sendButton = await waitFor(findSendButton, 3000);
-        if (sendButton) {
-            sendButton.click();
-            return true;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            const sendButton = await waitFor(findSendButton, SEND_BUTTON_WAIT_MS);
+            if (sendButton) {
+                try {
+                    sendButton.focus();
+                } catch {
+                    // Ignore focus failures and keep trying to submit.
+                }
+
+                sendButton.click();
+                const acknowledged = await waitFor(() => {
+                    if (!getComposerText(composer).trim()) {
+                        return true;
+                    }
+
+                    return findGenerationStopButton();
+                }, SEND_ACK_RETRY_WAIT_MS);
+                if (acknowledged) {
+                    return true;
+                }
+            }
         }
 
         return triggerEnterFallback(composer);
@@ -436,7 +522,11 @@
     }
 
     function getComposerText(composer) {
-        return composer.textContent || "";
+        if (typeof composer?.innerText === "string" && composer.innerText) {
+            return composer.innerText.replace(/\n$/, "");
+        }
+
+        return composer?.textContent || "";
     }
 
     async function ensureTemporaryChatMode(timeoutMs) {
@@ -540,17 +630,17 @@
         const root = document.querySelector("main") || document;
         const candidates = [];
         const seen = new Set();
-        const pushCandidate = (contentNode, hostNode) => {
-            if (!(contentNode instanceof HTMLElement)) {
+        const pushCandidate = (messageNode, hostNode) => {
+            if (!(messageNode instanceof HTMLElement)) {
                 return;
             }
 
-            const text = normalizeAssistantMessageText(contentNode.innerText || contentNode.textContent || "");
+            const text = extractAssistantMessageText(messageNode);
             if (!text) {
                 return;
             }
 
-            const keyNode = hostNode instanceof HTMLElement ? hostNode : contentNode;
+            const keyNode = hostNode instanceof HTMLElement ? hostNode : messageNode;
             const key = getElementKey(keyNode);
             if (seen.has(key)) {
                 return;
@@ -561,17 +651,54 @@
         };
 
         root.querySelectorAll("[data-message-author-role='assistant']").forEach((node) => {
-            const contentNode = node.querySelector(".markdown, .prose") || node;
-            pushCandidate(contentNode, node.closest("article") || node);
+            pushCandidate(node, node.closest("article") || node);
         });
 
         if (candidates.length === 0) {
+            const fallbackHosts = new Set();
             root.querySelectorAll("article .markdown, article .prose").forEach((node) => {
-                pushCandidate(node, node.closest("article") || node);
+                const hostNode = node.closest("article") || node;
+                if (!(hostNode instanceof HTMLElement) || fallbackHosts.has(hostNode)) {
+                    return;
+                }
+
+                fallbackHosts.add(hostNode);
+                pushCandidate(hostNode, hostNode);
             });
         }
 
         return candidates;
+    }
+
+    function extractAssistantMessageText(messageNode) {
+        if (!(messageNode instanceof HTMLElement)) {
+            return "";
+        }
+
+        const contentNodes = getTopLevelAssistantContentNodes(messageNode);
+        const parts = [];
+        const seen = new Set();
+
+        for (const contentNode of contentNodes) {
+            const text = normalizeAssistantMessageText(contentNode.innerText || contentNode.textContent || "");
+            if (!text || seen.has(text)) {
+                continue;
+            }
+
+            seen.add(text);
+            parts.push(text);
+        }
+
+        return normalizeAssistantMessageText(parts.join("\n\n"));
+    }
+
+    function getTopLevelAssistantContentNodes(messageNode) {
+        const contentNodes = Array.from(messageNode.querySelectorAll(".markdown, .prose")).filter((node) => node instanceof HTMLElement);
+        if (contentNodes.length === 0) {
+            return [messageNode];
+        }
+
+        return contentNodes.filter((candidate) => !contentNodes.some((other) => other !== candidate && other.contains(candidate)));
     }
 
     function isNewAssistantSnapshot(previousSnapshot, currentSnapshot) {
@@ -615,7 +742,9 @@
     function insertCharacter(composer, char) {
         const beforeText = normalizeComposerText(getComposerText(composer));
         placeCaretAtEnd(composer);
-        dispatchKeyboardSequence(composer, char);
+        if (shouldDispatchKeyboardSequence(char)) {
+            dispatchKeyboardSequence(composer, char);
+        }
 
         let insertedByExecCommand = false;
         try {
@@ -638,6 +767,14 @@
             })
         );
         return true;
+    }
+
+    function shouldDispatchKeyboardSequence(char) {
+        if (!char) {
+            return false;
+        }
+
+        return !/[\r\n\t]/.test(char);
     }
 
     function placeCaretAtEnd(composer) {
@@ -722,7 +859,10 @@
     }
 
     function normalizeComposerText(text) {
-        return `${text || ""}`.replace(/\u200B/g, "").replace(/\r\n?/g, "\n");
+        return `${text || ""}`
+            .replace(/\u00A0/g, " ")
+            .replace(/\u200B/g, "")
+            .replace(/\r\n?/g, "\n");
     }
 
     function dispatchKeyboardSequence(composer, char) {
@@ -803,6 +943,18 @@
         return true;
     }
 
+    function shouldUseImmediatePromptInsertion() {
+        if (document.hidden) {
+            return true;
+        }
+
+        try {
+            return typeof document.hasFocus === "function" && !document.hasFocus();
+        } catch {
+            return false;
+        }
+    }
+
     function getTypingDelay(char, typingSpeedMultiplier = DEFAULT_TYPING_SPEED_MULTIPLIER) {
         let delay = randomBetween(TYPING_DELAY_BASE_MIN_MS, TYPING_DELAY_BASE_MAX_MS);
         if (char === " " || char === "\n" || char === "\t") {
@@ -838,6 +990,10 @@
     }
 
     function getPreSubmitDelay() {
+        if (shouldUseImmediatePromptInsertion()) {
+            return SHORT_DELAY_MS;
+        }
+
         return PRE_SUBMIT_DELAY_MS + randomBetween(PRE_SUBMIT_JITTER_MIN_MS, PRE_SUBMIT_JITTER_MAX_MS);
     }
 

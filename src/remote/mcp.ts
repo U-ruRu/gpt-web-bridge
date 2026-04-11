@@ -13,7 +13,7 @@ const chatListSchema = z.array(z.number().int().positive()).min(1).optional().de
 export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context: RemoteMcpContext) {
     const server = new McpServer({
         name: "chatgpt-web-bridge-remote",
-        version: "0.4.0"
+        version: "0.5.0"
     });
 
     server.registerTool(
@@ -40,32 +40,9 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     );
 
     server.registerTool(
-        "chatgpt_web.ask",
-        {
-            description: "Send a prompt to a chat and wait for the assistant response.",
-            inputSchema: {
-                request: z.string().trim().min(1).describe("The prompt text to send to ChatGPT."),
-                chat: chatSchema
-            }
-        },
-        async ({ request, chat }) => {
-            const result = await orchestrator.ask(context.userId, context.mcpSessionId, request, chat);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: result.response
-                    }
-                ],
-                structuredContent: result as unknown as Record<string, unknown>
-            };
-        }
-    );
-
-    server.registerTool(
         "chatgpt_web.ask_async",
         {
-            description: "Send a prompt to a chat and return after the prompt is accepted by ChatGPT.",
+            description: "Queue a prompt for a chat and return a persistent message id immediately.",
             inputSchema: {
                 request: z.string().trim().min(1).describe("The prompt text to send to ChatGPT."),
                 chat: chatSchema
@@ -77,7 +54,7 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
                 content: [
                     {
                         type: "text",
-                        text: `${result.chat}`
+                        text: `${result.chat}:${result.message}`
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -88,18 +65,19 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     server.registerTool(
         "chatgpt_web.await_response",
         {
-            description: "Wait for the assistant response for a chat that already has an active request.",
+            description: "Read the current state of a previously queued message.",
             inputSchema: {
-                chat: chatSchema
+                chat: z.number().int().positive().describe("Chat number."),
+                message: z.number().int().positive().describe("Message number returned by chatgpt_web.ask_async.")
             }
         },
-        async ({ chat }) => {
-            const result = await orchestrator.awaitResponse(context.userId, context.mcpSessionId, chat);
+        async ({ chat, message }) => {
+            const result = await orchestrator.awaitResponse(context.userId, context.mcpSessionId, chat, message);
             return {
                 content: [
                     {
                         type: "text",
-                        text: result.response
+                        text: result.status === "completed" ? result.response : result.status
                     }
                 ],
                 structuredContent: result as unknown as Record<string, unknown>
@@ -108,9 +86,52 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     );
 
     server.registerTool(
+        "chatgpt_web.response_status",
+        {
+            description: "Return the status of all retained chats and messages for the current user."
+        },
+        async () => {
+            const result = await orchestrator.getResponseStatus(context.userId, context.mcpSessionId);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(result)
+                    }
+                ],
+                structuredContent: result as unknown as Record<string, unknown>
+            };
+        }
+    );
+
+    server.registerTool(
+        "chatgpt_web.wait",
+        {
+            description: "Pause for a short amount of time so the client can back off between polling attempts.",
+            inputSchema: {
+                seconds: z.number().int().min(1).max(110).describe("How long to wait.")
+            }
+        },
+        async ({ seconds }) => {
+            await sleep(seconds * 1000);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `waited ${seconds}`
+                    }
+                ],
+                structuredContent: {
+                    waitedSec: seconds
+                } as Record<string, unknown>
+            };
+        }
+    );
+
+    server.registerTool(
         "chatgpt_web.release_chat",
         {
-            description: "Release a chat and close its automation tab.",
+            description: "Release a chat and close its automation tab while keeping retained history available.",
             inputSchema: {
                 chat: chatSchema,
                 chats: chatListSchema
@@ -130,24 +151,9 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
         }
     );
 
-    server.registerTool(
-        "chatgpt_web.session_info",
-        {
-            description: "Return the default chat and the status of all active chats for the current user."
-        },
-        async () => {
-            const result = orchestrator.getSessionInfo(context.userId, context.mcpSessionId);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(result)
-                    }
-                ],
-                structuredContent: result as unknown as Record<string, unknown>
-            };
-        }
-    );
-
     return server;
+}
+
+function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -8,6 +8,7 @@ const RECONNECT_DELAY_MS = 3000;
 const CONNECT_TIMEOUT_MS = 10000;
 const PARALLEL_CHATS_DEFAULT_MODE = "sequential_safe_timeout";
 const TYPING_SPEED_DEFAULT_MULTIPLIER = 4;
+const TEMPORARY_MODE_DELAY_DEFAULT_SECONDS = 5;
 const SAFE_TIMEOUT_MIN_MS = 3000;
 const SAFE_TIMEOUT_MAX_MS = 10000;
 
@@ -172,6 +173,10 @@ function normalizeAgentConfig(value) {
     const userToken = normalizeNullableString(value.userToken);
     const parallelChatsMode = normalizeParallelChatsMode(value.parallelChatsMode) || PARALLEL_CHATS_DEFAULT_MODE;
     const typingSpeedMultiplier = normalizeTypingSpeedMultiplier(value.typingSpeedMultiplier) || TYPING_SPEED_DEFAULT_MULTIPLIER;
+    const normalizedTemporaryModeDelaySeconds = normalizeTemporaryModeDelaySeconds(value.temporaryModeDelaySeconds);
+    const temporaryModeDelaySeconds = normalizedTemporaryModeDelaySeconds === null
+        ? TEMPORARY_MODE_DELAY_DEFAULT_SECONDS
+        : normalizedTemporaryModeDelaySeconds;
     if (!serverUrl || !serverAccessToken || !userToken) {
         return null;
     }
@@ -181,7 +186,8 @@ function normalizeAgentConfig(value) {
         serverAccessToken,
         userToken,
         parallelChatsMode,
-        typingSpeedMultiplier
+        typingSpeedMultiplier,
+        temporaryModeDelaySeconds
     };
 }
 
@@ -239,12 +245,7 @@ async function connectAgentIfConfigured(reason) {
         await appendDebugLog("background", "info", "WebSocket connection is open. Waiting for agent.ready.", {
             serverUrl: config.serverUrl
         });
-        sendToAgent({
-            type: "agent.hello",
-            serverAccessToken: config.serverAccessToken,
-            userToken: config.userToken,
-            browserName: "firefox"
-        });
+        sendToAgent(createAgentHelloMessage(config));
     });
 
     socket.addEventListener("message", async (event) => {
@@ -385,6 +386,15 @@ function sendToAgent(message) {
     agentSocket.send(JSON.stringify(message));
 }
 
+function canForwardDebugLogToServer() {
+    return Boolean(
+        agentSocket &&
+        agentSocket.readyState === WebSocket.OPEN &&
+        agentConnectionState.connected &&
+        agentConnectionState.status === "ready"
+    );
+}
+
 async function handleAgentMessage(message) {
     if (message?.type === "agent.ready") {
         clearConnectTimeoutTimer();
@@ -506,6 +516,21 @@ function queueSessionJob(sessionToken, job) {
 
 function getParallelChatsMode(config) {
     return normalizeParallelChatsMode(config?.parallelChatsMode) || PARALLEL_CHATS_DEFAULT_MODE;
+}
+
+function getTemporaryModeDelaySeconds(config) {
+    const normalized = normalizeTemporaryModeDelaySeconds(config?.temporaryModeDelaySeconds);
+    return normalized === null ? TEMPORARY_MODE_DELAY_DEFAULT_SECONDS : normalized;
+}
+
+function createAgentHelloMessage(config) {
+    return {
+        type: "agent.hello",
+        serverAccessToken: config.serverAccessToken,
+        userToken: config.userToken,
+        browserName: "firefox",
+        temporaryModeDelaySeconds: getTemporaryModeDelaySeconds(config)
+    };
 }
 
 function isSequentialParallelChatsMode(mode) {
@@ -1124,6 +1149,23 @@ function normalizeTypingSpeedMultiplier(value) {
     return Math.round(normalized * 100) / 100;
 }
 
+function normalizeTemporaryModeDelaySeconds(value) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        return Math.round(value);
+    }
+
+    if (typeof value !== "string") {
+        return null;
+    }
+
+    const normalized = Number.parseFloat(value.trim().replace(",", "."));
+    if (!Number.isFinite(normalized) || normalized < 0) {
+        return null;
+    }
+
+    return Math.round(normalized);
+}
+
 function normalizeConversationUrl(value) {
     const normalized = normalizeNullableString(value);
     if (!normalized) {
@@ -1180,5 +1222,22 @@ async function appendDebugLog(source, level, message, context) {
     await browser.storage.local.set({
         [DEBUG_LOGS_KEY]: currentLogs.slice(-DEBUG_LOG_LIMIT)
     });
+
+    if (canForwardDebugLogToServer()) {
+        try {
+            sendToAgent({
+                type: "agent.log",
+                level: normalizedLevel,
+                message: normalizedMessage,
+                context: {
+                    source: normalizedSource,
+                    ...(isPlainObject(context) ? context : {})
+                }
+            });
+        } catch {
+            // Ignore telemetry delivery failures and keep local logging intact.
+        }
+    }
+
     return { ok: true };
 }

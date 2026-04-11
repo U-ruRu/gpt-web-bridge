@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import WebSocket from "ws";
-import { waitFor } from "./helpers.js";
+import { cleanupTempDir, createTempDir, waitFor } from "./helpers.js";
 
 const projectDir = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const distEntryPath = join(projectDir, "dist", "index.js");
@@ -17,11 +17,13 @@ function extractServerBaseUrl(stderrText) {
     return match?.[1] || null;
 }
 
-function createAgentClient(baseUrl, serverAccessToken, userToken) {
+function createAgentClient(baseUrl, serverAccessToken, userToken, options = {}) {
     const websocketUrl = `${baseUrl.replace(/^http/, "ws")}/agent/ws`;
     const socket = new WebSocket(websocketUrl);
     const receivedMessages = [];
     const sessionModes = new Map();
+    const askAcceptedDelayMs = options.askAcceptedDelayMs ?? 20;
+    const askResultDelayMs = options.askResultDelayMs ?? 120;
 
     socket.on("open", () => {
         socket.send(JSON.stringify({
@@ -29,7 +31,8 @@ function createAgentClient(baseUrl, serverAccessToken, userToken) {
             serverAccessToken,
             userToken,
             browserName: "test-agent",
-            browserVersion: "1.0.0"
+            browserVersion: "1.0.0",
+            ...(options.temporaryModeDelaySeconds !== undefined ? { temporaryModeDelaySeconds: options.temporaryModeDelaySeconds } : {})
         }));
     });
 
@@ -88,7 +91,7 @@ function createAgentClient(baseUrl, serverAccessToken, userToken) {
                     conversationUrl: `https://chatgpt.com/c/${message.sessionToken}`,
                     mode
                 }));
-            }, 20);
+            }, askAcceptedDelayMs);
 
             setTimeout(() => {
                 socket.send(JSON.stringify({
@@ -100,7 +103,7 @@ function createAgentClient(baseUrl, serverAccessToken, userToken) {
                     conversationUrl: `https://chatgpt.com/c/${message.sessionToken}`,
                     mode
                 }));
-            }, 60);
+            }, askResultDelayMs);
             return;
         }
 
@@ -148,17 +151,23 @@ async function createMcpClient(baseUrl, serverAccessToken, userToken) {
     };
 }
 
-async function withRemoteServer(t, callback) {
+async function withRemoteServer(t, callback, options = {}) {
     const serverAccessToken = "test-server-access-token";
     const userToken = "user-alpha";
+    const dataRootDir = await createTempDir();
     let stderrText = "";
+
+    t.after(async () => {
+        await cleanupTempDir(dataRootDir);
+    });
 
     const child = spawn(process.execPath, [
         distEntryPath,
         "--transport=server",
         "--host=127.0.0.1",
         "--port=0",
-        `--server-access-token=${serverAccessToken}`
+        `--server-access-token=${serverAccessToken}`,
+        `--data-dir=${dataRootDir}`
     ], {
         cwd: projectDir,
         stdio: ["ignore", "ignore", "pipe"]
@@ -177,7 +186,7 @@ async function withRemoteServer(t, callback) {
         intervalMs: 100
     });
 
-    const agent = createAgentClient(baseUrl, serverAccessToken, userToken);
+    const agent = createAgentClient(baseUrl, serverAccessToken, userToken, options.agentOptions);
     t.after(async () => {
         agent.socket.close();
     });
@@ -201,24 +210,25 @@ async function withRemoteServer(t, callback) {
         agent,
         baseUrl,
         child,
+        dataRootDir,
         first,
         serverAccessToken,
         userToken
     });
 }
 
-test("remote server exposes simplified chat tools and reuses freed chat numbers", { timeout: 30000 }, async (t) => {
+test("remote server exposes async-only chat tools and durable message status", { timeout: 30000 }, async (t) => {
     await withRemoteServer(t, async ({ agent, first }) => {
         const tools = await first.client.listTools();
         assert.deepEqual(
             tools.tools.map((tool) => tool.name).sort(),
             [
-                "chatgpt_web.ask",
                 "chatgpt_web.ask_async",
                 "chatgpt_web.await_response",
                 "chatgpt_web.new_chat",
                 "chatgpt_web.release_chat",
-                "chatgpt_web.session_info"
+                "chatgpt_web.response_status",
+                "chatgpt_web.wait"
             ]
         );
 
@@ -231,10 +241,15 @@ test("remote server exposes simplified chat tools and reuses freed chat numbers"
         assert.deepEqual(firstChat.structuredContent, { chat: 1 });
 
         const startMessage = agent.receivedMessages.find((entry) => entry.message.type === "session.start");
-        const temporaryMessage = agent.receivedMessages.find((entry) => entry.message.type === "session.setTemporary");
+        const temporaryMessage = await waitFor(() => {
+            return agent.receivedMessages.find((entry) => entry.message.type === "session.setTemporary") || null;
+        }, {
+            timeoutMs: 10000,
+            intervalMs: 50
+        });
         assert.ok(startMessage, "new_chat() should open a chat tab");
         assert.ok(temporaryMessage, "new_chat() should enable temporary mode by default");
-        assert.ok(temporaryMessage.receivedAt - firstChatStartedAt >= 2900);
+        assert.ok(temporaryMessage.receivedAt - firstChatStartedAt >= 4900);
 
         const secondChat = await first.client.callTool({
             name: "chatgpt_web.new_chat",
@@ -252,11 +267,13 @@ test("remote server exposes simplified chat tools and reuses freed chat numbers"
                 request: "hello from first"
             }
         });
-        assert.equal(askAsync.content[0].text, "1");
-        assert.deepEqual(askAsync.structuredContent, { chat: 1 });
+        assert.equal(askAsync.structuredContent.chat, 1);
+        assert.equal(askAsync.structuredContent.message, 1);
+        assert.equal(typeof askAsync.structuredContent.etaMinMs, "number");
+        assert.equal(typeof askAsync.structuredContent.etaMaxMs, "number");
 
         const duplicateAsk = await first.client.callTool({
-            name: "chatgpt_web.ask",
+            name: "chatgpt_web.ask_async",
             arguments: {
                 chat: 1,
                 request: "should fail"
@@ -265,60 +282,102 @@ test("remote server exposes simplified chat tools and reuses freed chat numbers"
         assert.equal(duplicateAsk.isError, true);
         assert.match(duplicateAsk.content[0].text, /active request|unfinished request|409/i);
 
-        const sessionInfo = await first.client.callTool({
-            name: "chatgpt_web.session_info",
-            arguments: {}
+        const pendingResponse = await first.client.callTool({
+            name: "chatgpt_web.await_response",
+            arguments: {
+                chat: 1,
+                message: 1
+            }
         });
-        assert.deepEqual(sessionInfo.structuredContent, {
+        assert.equal(pendingResponse.structuredContent.status, "pending");
+        assert.equal(typeof pendingResponse.structuredContent.elapsedMs, "number");
+
+        const responseStatusWhilePending = await waitFor(async () => {
+            const responseStatus = await first.client.callTool({
+                name: "chatgpt_web.response_status",
+                arguments: {}
+            });
+            return responseStatus.structuredContent.chats[0].messages[0].status === "pending" ? responseStatus : null;
+        }, {
+            timeoutMs: 5000,
+            intervalMs: 50
+        });
+
+        assert.deepEqual(responseStatusWhilePending.structuredContent, {
             defaultChat: 2,
+            averageGenerationMs: null,
             chats: [
                 {
                     chat: 1,
                     state: "waiting_response",
-                    temporary: true
+                    temporary: true,
+                    messages: [
+                        {
+                            message: 1,
+                            status: "pending",
+                            read: false,
+                            createdAt: responseStatusWhilePending.structuredContent.chats[0].messages[0].createdAt,
+                            completedAt: null,
+                            elapsedMs: responseStatusWhilePending.structuredContent.chats[0].messages[0].elapsedMs,
+                            generationMs: null
+                        }
+                    ]
                 },
                 {
                     chat: 2,
                     state: "ready",
-                    temporary: false
+                    temporary: false,
+                    messages: []
                 }
             ]
         });
 
-        const response = await first.client.callTool({
-            name: "chatgpt_web.await_response",
-            arguments: {
-                chat: 1
-            }
+        const completed = await waitFor(async () => {
+            const response = await first.client.callTool({
+                name: "chatgpt_web.await_response",
+                arguments: {
+                    chat: 1,
+                    message: 1
+                }
+            });
+            return response.structuredContent.status === "completed" ? response : null;
+        }, {
+            timeoutMs: 5000,
+            intervalMs: 50
         });
-        assert.equal(response.content[0].text, "reply:hello from first");
-        assert.deepEqual(response.structuredContent, {
-            response: "reply:hello from first"
+        assert.equal(completed.content[0].text, "reply:hello from first");
+        assert.deepEqual(completed.structuredContent, {
+            status: "completed",
+            chat: 1,
+            message: 1,
+            response: "reply:hello from first",
+            read: true
         });
 
-        const release = await first.client.callTool({
-            name: "chatgpt_web.release_chat",
-            arguments: {
-                chat: 1
-            }
+        const responseStatusAfterCompletion = await first.client.callTool({
+            name: "chatgpt_web.response_status",
+            arguments: {}
         });
-        assert.equal(release.content[0].text, "ok");
-        assert.deepEqual(release.structuredContent, {
-            ok: true
-        });
+        assert.equal(typeof responseStatusAfterCompletion.structuredContent.averageGenerationMs, "number");
+        assert.equal(responseStatusAfterCompletion.structuredContent.chats[0].state, "ready");
+        assert.equal(responseStatusAfterCompletion.structuredContent.chats[0].messages[0].status, "completed");
+        assert.equal(responseStatusAfterCompletion.structuredContent.chats[0].messages[0].read, true);
+        assert.equal(typeof responseStatusAfterCompletion.structuredContent.chats[0].messages[0].generationMs, "number");
 
-        const reusedChat = await first.client.callTool({
-            name: "chatgpt_web.new_chat",
+        const waitResult = await first.client.callTool({
+            name: "chatgpt_web.wait",
             arguments: {
-                temporary: false
+                seconds: 1
             }
         });
-        assert.equal(reusedChat.content[0].text, "1");
-        assert.deepEqual(reusedChat.structuredContent, { chat: 1 });
+        assert.equal(waitResult.content[0].text, "waited 1");
+        assert.deepEqual(waitResult.structuredContent, {
+            waitedSec: 1
+        });
     });
 });
 
-test("remote server can open and release multiple chats in one tool call", { timeout: 30000 }, async (t) => {
+test("remote server can open and release multiple chats without reusing chat numbers", { timeout: 30000 }, async (t) => {
     await withRemoteServer(t, async ({ first }) => {
         const openedChats = await first.client.callTool({
             name: "chatgpt_web.new_chat",
@@ -332,28 +391,17 @@ test("remote server can open and release multiple chats in one tool call", { tim
             chats: [1, 2, 3]
         });
 
-        const sessionInfoBeforeRelease = await first.client.callTool({
-            name: "chatgpt_web.session_info",
+        const responseStatusBeforeRelease = await first.client.callTool({
+            name: "chatgpt_web.response_status",
             arguments: {}
         });
-        assert.deepEqual(sessionInfoBeforeRelease.structuredContent, {
+        assert.deepEqual(responseStatusBeforeRelease.structuredContent, {
             defaultChat: 3,
+            averageGenerationMs: null,
             chats: [
-                {
-                    chat: 1,
-                    state: "ready",
-                    temporary: false
-                },
-                {
-                    chat: 2,
-                    state: "ready",
-                    temporary: false
-                },
-                {
-                    chat: 3,
-                    state: "ready",
-                    temporary: false
-                }
+                { chat: 1, state: "ready", temporary: false, messages: [] },
+                { chat: 2, state: "ready", temporary: false, messages: [] },
+                { chat: 3, state: "ready", temporary: false, messages: [] }
             ]
         });
 
@@ -368,35 +416,35 @@ test("remote server can open and release multiple chats in one tool call", { tim
             ok: true
         });
 
-        const sessionInfoAfterRelease = await first.client.callTool({
-            name: "chatgpt_web.session_info",
+        const responseStatusAfterRelease = await first.client.callTool({
+            name: "chatgpt_web.response_status",
             arguments: {}
         });
-        assert.deepEqual(sessionInfoAfterRelease.structuredContent, {
+        assert.deepEqual(responseStatusAfterRelease.structuredContent, {
             defaultChat: null,
+            averageGenerationMs: null,
             chats: [
-                {
-                    chat: 2,
-                    state: "ready",
-                    temporary: false
-                }
+                { chat: 1, state: "released", temporary: false, messages: [] },
+                { chat: 2, state: "ready", temporary: false, messages: [] },
+                { chat: 3, state: "released", temporary: false, messages: [] }
             ]
         });
 
-        const reusedChats = await first.client.callTool({
+        const nextChat = await first.client.callTool({
             name: "chatgpt_web.new_chat",
             arguments: {
-                count: 2,
                 temporary: false
             }
         });
-        assert.deepEqual(reusedChats.structuredContent, {
-            chats: [1, 3]
-        });
+        assert.deepEqual(nextChat.structuredContent, { chat: 4 });
+    }, {
+        agentOptions: {
+            temporaryModeDelaySeconds: 0
+        }
     });
 });
 
-test("remote server keeps chats alive after an MCP transport session closes", { timeout: 30000 }, async (t) => {
+test("remote server keeps released history and chats after an MCP transport session closes", { timeout: 30000 }, async (t) => {
     await withRemoteServer(t, async ({ baseUrl, child, serverAccessToken, userToken, first }) => {
         const openedChat = await first.client.callTool({
             name: "chatgpt_web.new_chat",
@@ -405,6 +453,30 @@ test("remote server keeps chats alive after an MCP transport session closes", { 
             }
         });
         assert.deepEqual(openedChat.structuredContent, { chat: 1 });
+
+        const askAsync = await first.client.callTool({
+            name: "chatgpt_web.ask_async",
+            arguments: {
+                chat: 1,
+                request: "persist me"
+            }
+        });
+        assert.deepEqual(askAsync.structuredContent.chat, 1);
+        assert.deepEqual(askAsync.structuredContent.message, 1);
+
+        await waitFor(async () => {
+            const completed = await first.client.callTool({
+                name: "chatgpt_web.await_response",
+                arguments: {
+                    chat: 1,
+                    message: 1
+                }
+            });
+            return completed.structuredContent.status === "completed" ? true : null;
+        }, {
+            timeoutMs: 5000,
+            intervalMs: 50
+        });
 
         await Promise.allSettled([
             first.client.close(),
@@ -424,19 +496,32 @@ test("remote server keeps chats alive after an MCP transport session closes", { 
             ]);
         });
 
-        const sessionInfo = await second.client.callTool({
-            name: "chatgpt_web.session_info",
+        const responseStatus = await second.client.callTool({
+            name: "chatgpt_web.response_status",
             arguments: {}
         });
-        assert.deepEqual(sessionInfo.structuredContent, {
-            defaultChat: null,
-            chats: [
-                {
-                    chat: 1,
-                    state: "ready",
-                    temporary: false
-                }
-            ]
-        });
+        assert.equal(responseStatus.structuredContent.defaultChat, null);
+        assert.deepEqual(responseStatus.structuredContent.chats, [
+            {
+                chat: 1,
+                state: "ready",
+                temporary: false,
+                messages: [
+                    {
+                        message: 1,
+                        status: "completed",
+                        read: true,
+                        createdAt: responseStatus.structuredContent.chats[0].messages[0].createdAt,
+                        completedAt: responseStatus.structuredContent.chats[0].messages[0].completedAt,
+                        elapsedMs: responseStatus.structuredContent.chats[0].messages[0].elapsedMs,
+                        generationMs: responseStatus.structuredContent.chats[0].messages[0].generationMs
+                    }
+                ]
+            }
+        ]);
+    }, {
+        agentOptions: {
+            temporaryModeDelaySeconds: 0
+        }
     });
 });

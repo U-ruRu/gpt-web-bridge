@@ -14,7 +14,7 @@ function extractBridgeBaseUrl(stderrText) {
     return match?.[1] || null;
 }
 
-test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 20000 }, async (t) => {
+test("stdio MCP exposes async-only tools and persists message state", { timeout: 20000 }, async (t) => {
     const dataRootDir = await createTempDir();
     const sessionId = "mcp-stdio-session";
     let stderrText = "";
@@ -59,9 +59,12 @@ test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 
     const tools = await client.listTools();
     const toolNames = tools.tools.map((tool) => tool.name).sort();
     assert.deepEqual(toolNames, [
-        "chatgpt_web.ask",
+        "chatgpt_web.ask_async",
+        "chatgpt_web.await_response",
         "chatgpt_web.new_chat",
-        "chatgpt_web.set_temporary"
+        "chatgpt_web.response_status",
+        "chatgpt_web.set_temporary",
+        "chatgpt_web.wait"
     ]);
 
     const temporaryPromise = client.callTool({
@@ -94,12 +97,17 @@ test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 
     const temporaryResult = await temporaryPromise;
     assert.equal(temporaryResult.structuredContent.status, "completed");
 
-    const askPromise = client.callTool({
-        name: "chatgpt_web.ask",
+    const askAsyncResult = await client.callTool({
+        name: "chatgpt_web.ask_async",
         arguments: {
-            request: "Привет из MCP"
+            request: "Привет из MCP",
+            chat: 1
         }
     });
+    assert.equal(askAsyncResult.structuredContent.chat, 1);
+    assert.equal(askAsyncResult.structuredContent.message, 1);
+    assert.equal(typeof askAsyncResult.structuredContent.etaMinMs, "number");
+    assert.equal(typeof askAsyncResult.structuredContent.etaMaxMs, "number");
 
     const pendingJob = await waitFor(async () => {
         const response = await fetch(`${bridgeBaseUrl}/session/next?sessionId=${sessionId}`);
@@ -111,6 +119,21 @@ test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 
     });
 
     assert.equal(pendingJob.sessionId, sessionId);
+    assert.equal(pendingJob.chat, 1);
+    assert.equal(pendingJob.message, 1);
+
+    const pendingStatus = await client.callTool({
+        name: "chatgpt_web.await_response",
+        arguments: {
+            chat: 1,
+            message: 1
+        }
+    });
+    assert.deepEqual(pendingStatus.structuredContent.status, "pending");
+    assert.equal(pendingStatus.structuredContent.chat, 1);
+    assert.equal(pendingStatus.structuredContent.message, 1);
+    assert.equal(typeof pendingStatus.structuredContent.elapsedMs, "number");
+
     await fetch(`${bridgeBaseUrl}/jobs/${pendingJob.id}/status`, {
         method: "POST",
         headers: {
@@ -121,6 +144,15 @@ test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 
             detail: "Accepted by MCP test."
         })
     });
+
+    await sleep(20);
+    const responseStatusWhileRunning = await client.callTool({
+        name: "chatgpt_web.response_status",
+        arguments: {}
+    });
+    assert.equal(responseStatusWhileRunning.structuredContent.defaultChat, 1);
+    assert.equal(responseStatusWhileRunning.structuredContent.chats[0].messages[0].status, "pending");
+
     await fetch(`${bridgeBaseUrl}/jobs/${pendingJob.id}/status`, {
         method: "POST",
         headers: {
@@ -134,11 +166,57 @@ test("stdio MCP exposes tools and returns assistant text for ask()", { timeout: 
         })
     });
 
-    const askResult = await askPromise;
-    assert.equal(askResult.content[0].type, "text");
-    assert.equal(askResult.content[0].text, "Привет из теста MCP");
-    assert.equal(askResult.structuredContent.responseText, "Привет из теста MCP");
-    assert.equal(askResult.structuredContent.sessionId, sessionId);
+    const completed = await client.callTool({
+        name: "chatgpt_web.await_response",
+        arguments: {
+            chat: 1,
+            message: 1
+        }
+    });
+    assert.equal(completed.content[0].text, "Привет из теста MCP");
+    assert.deepEqual(completed.structuredContent, {
+        status: "completed",
+        chat: 1,
+        message: 1,
+        response: "Привет из теста MCP",
+        read: true
+    });
+
+    const responseStatusAfterCompletion = await client.callTool({
+        name: "chatgpt_web.response_status",
+        arguments: {}
+    });
+    assert.equal(typeof responseStatusAfterCompletion.structuredContent.averageGenerationMs, "number");
+    assert.deepEqual(responseStatusAfterCompletion.structuredContent.chats, [
+        {
+            chat: 1,
+            state: "ready",
+            temporary: true,
+            messages: [
+                {
+                    message: 1,
+                    status: "completed",
+                    read: true,
+                    createdAt: responseStatusAfterCompletion.structuredContent.chats[0].messages[0].createdAt,
+                    completedAt: responseStatusAfterCompletion.structuredContent.chats[0].messages[0].completedAt,
+                    elapsedMs: responseStatusAfterCompletion.structuredContent.chats[0].messages[0].elapsedMs,
+                    generationMs: responseStatusAfterCompletion.structuredContent.chats[0].messages[0].generationMs
+                }
+            ]
+        }
+    ]);
+    assert.equal(typeof responseStatusAfterCompletion.structuredContent.chats[0].messages[0].generationMs, "number");
+
+    const waitResult = await client.callTool({
+        name: "chatgpt_web.wait",
+        arguments: {
+            seconds: 1
+        }
+    });
+    assert.equal(waitResult.content[0].text, "waited 1");
+    assert.deepEqual(waitResult.structuredContent, {
+        waitedSec: 1
+    });
 
     await sleep(100);
     assert.match(stderrText, /\[mcp\] MCP stdio server is ready for session mcp-stdio-session/);

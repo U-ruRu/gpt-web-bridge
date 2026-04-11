@@ -4,36 +4,40 @@
 [Перейти к инструкции по установке](./INSTALL.md)  
 [Перейти к базовому system prompt](./system_prompt.md)
 
-Этот документ отвечает только за использование: рабочую модель чатов, MCP tool'ы, статусы, batch-операции и типовые сценарии.
+Этот документ описывает рабочую модель `chatgpt_web.*`: чаты, сообщения, статусы и типовой async-only сценарий.
 
 ## Базовый сценарий
 
 1. Вызовите `chatgpt_web.new_chat`
 2. Сохраните номер чата
-3. Вызовите `chatgpt_web.ask` или `chatgpt_web.ask_async`
-4. Если использовали `ask_async`, затем вызовите `chatgpt_web.await_response`
-5. Когда чат больше не нужен, вызовите `chatgpt_web.release_chat`
+3. Вызовите `chatgpt_web.ask_async`
+4. При необходимости вызовите `chatgpt_web.wait`
+5. Проверяйте готовность через `chatgpt_web.await_response` или `chatgpt_web.response_status`
+6. Когда чат больше не нужен, вызовите `chatgpt_web.release_chat`
 
-## Модель чатов
+Ответы теперь сохраняются на сервере. Финальный результат можно забрать позже по связке `chat + message`, а не только в рамках одного длинного tool call.
+
+## Модель чатов и сообщений
 
 - каждый `user token` имеет собственное пространство чатов;
-- чаты нумеруются как `1`, `2`, `3` и выдаются сервером;
-- `new_chat` возвращает минимальный свободный номер, а при batch-вызове массив минимальных свободных номеров;
-- после `release_chat` номер снова становится доступным;
-- если параметр `chat` не передан, используется `defaultChat` текущего MCP-сеанса;
-- в одном чате одновременно разрешен только один незавершенный запрос.
+- чаты нумеруются как `1`, `2`, `3` и больше не переиспользуются;
+- `release_chat` закрывает live-вкладку, но retained история сообщений остается доступной;
+- каждый `ask_async` создает сообщение внутри чата с монотонным номером `message`;
+- в одном чате одновременно разрешено только одно активное сообщение в статусе `sending` или `pending`;
+- после того как расширение вернуло финальный результат на сервер, чат снова становится `ready`, даже если клиент еще не считал ответ через `await_response`.
 
 ## MCP tools
 
 ### `chatgpt_web.new_chat`
 
-Создает один или несколько новых чатов.
+Открывает один или несколько новых чатов.
 
 По умолчанию:
 
-- сервер ждет готовности новой вкладки;
-- через 3 секунды включает `temporary`;
-- только после этого возвращает результат.
+- создается `temporary` чат;
+- сервер ждет, пока вкладка станет готовой;
+- перед включением temporary mode используется задержка из настроек расширения;
+- значение по умолчанию для этой задержки: `5` секунд.
 
 Открыть один чат:
 
@@ -74,32 +78,9 @@
 }
 ```
 
-### `chatgpt_web.ask`
-
-Отправляет запрос и ждет финальный ответ.
-
-Пример:
-
-```json
-{
-  "chat": 1,
-  "request": "Ответь одним словом."
-}
-```
-
-Ответ:
-
-```json
-{
-  "response": "Готово"
-}
-```
-
-Если `chat` не передан, запрос уйдет в `defaultChat`.
-
 ### `chatgpt_web.ask_async`
 
-Отправляет запрос, но возвращается сразу после того, как prompt реально отправлен в ChatGPT.
+Отправляет prompt и сразу возвращает идентификатор сообщения.
 
 Пример:
 
@@ -114,21 +95,128 @@
 
 ```json
 {
-  "chat": 1
+  "chat": 1,
+  "message": 7,
+  "etaMinMs": 120000,
+  "etaMaxMs": 300000
 }
 ```
 
-Пока ответ по чату не считан через `await_response`, повторный `ask` или `ask_async` в тот же чат вернет ошибку.
+`etaMinMs` и `etaMaxMs` строятся по retained-статистике завершенных сообщений: это ориентир, а не SLA.
+
+Если `chat` не передан, используется `defaultChat` текущего MCP-сеанса.
 
 ### `chatgpt_web.await_response`
 
-Ждет финальный ответ по уже отправленному запросу.
+Возвращает текущее состояние конкретного сообщения по `chat + message`.
 
 Пример:
 
 ```json
 {
-  "chat": 1
+  "chat": 1,
+  "message": 7
+}
+```
+
+Ответ, пока генерация еще идет:
+
+```json
+{
+  "status": "pending",
+  "chat": 1,
+  "message": 7,
+  "elapsedMs": 18342
+}
+```
+
+Ответ при успехе:
+
+```json
+{
+  "status": "completed",
+  "chat": 1,
+  "message": 7,
+  "response": "Краткое резюме готово.",
+  "read": true
+}
+```
+
+Ответ при ошибке:
+
+```json
+{
+  "status": "failed",
+  "chat": 1,
+  "message": 7,
+  "detail": "The browser agent lost the session.",
+  "elapsedMs": 24511
+}
+```
+
+`await_response` идемпотентен: повторный вызов по уже завершенному сообщению вернет тот же terminal result.
+
+### `chatgpt_web.response_status`
+
+Возвращает retained состояние чатов и сообщений без тел ответов.
+
+Пример ответа:
+
+```json
+{
+  "defaultChat": 2,
+  "averageGenerationMs": 91437,
+  "chats": [
+    {
+      "chat": 1,
+      "state": "released",
+      "temporary": true,
+      "messages": [
+        {
+          "message": 3,
+          "status": "completed",
+          "read": true,
+          "createdAt": "2026-04-09T10:00:00.000Z",
+          "completedAt": "2026-04-09T10:01:12.000Z",
+          "elapsedMs": 72000,
+          "generationMs": 68000
+        }
+      ]
+    },
+    {
+      "chat": 2,
+      "state": "waiting_response",
+      "temporary": false,
+      "messages": [
+        {
+          "message": 7,
+          "status": "pending",
+          "read": false,
+          "createdAt": "2026-04-09T10:02:00.000Z",
+          "completedAt": null,
+          "elapsedMs": 18342,
+          "generationMs": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+`averageGenerationMs`:
+
+- в remote-сервере считается по всем retained completed сообщениям всех пользователей;
+- в stdio-режиме считается по retained completed сообщениям текущего локального data root.
+
+### `chatgpt_web.wait`
+
+Удобный backoff-tool для polling.
+
+Пример:
+
+```json
+{
+  "seconds": 5
 }
 ```
 
@@ -136,13 +224,15 @@
 
 ```json
 {
-  "response": "Краткое резюме готово."
+  "waitedSec": 5
 }
 ```
 
+Текстовый content tool-а будет `waited 5`.
+
 ### `chatgpt_web.release_chat`
 
-Закрывает чат и освобождает его номер.
+Закрывает live-чат, но не удаляет retained историю.
 
 Освободить один чат:
 
@@ -168,65 +258,19 @@
 }
 ```
 
-Если по любому из выбранных чатов еще есть незавершенный запрос, сервер вернет ошибку.
-
-### `chatgpt_web.session_info`
-
-Возвращает `defaultChat` и список всех активных чатов пользователя.
-
-Пример ответа:
-
-```json
-{
-  "defaultChat": 2,
-  "chats": [
-    {
-      "chat": 1,
-      "state": "waiting_response",
-      "temporary": true
-    },
-    {
-      "chat": 2,
-      "state": "ready",
-      "temporary": false
-    }
-  ]
-}
-```
-
 ## Статусы чатов
 
-Возможные состояния в `session_info`:
+`response_status` возвращает следующие состояния:
 
 - `starting` — чат создается, вкладка еще не готова;
-- `ready` — чат готов принимать запросы;
-- `sending` — prompt еще отправляется;
-- `waiting_response` — prompt уже отправлен, идет ожидание финального ответа.
-
-Важно:
-
-- в чат со статусом `starting` нельзя отправлять запрос;
-- в чат со статусом `sending` или `waiting_response` нельзя отправлять второй запрос;
-- после успешного `await_response` чат возвращается в `ready`.
-
-## Синхронный и асинхронный сценарий
-
-Синхронный:
-
-1. `chatgpt_web.new_chat`
-2. `chatgpt_web.ask`
-3. `chatgpt_web.release_chat`
-
-Асинхронный:
-
-1. `chatgpt_web.new_chat`
-2. `chatgpt_web.ask_async`
-3. `chatgpt_web.await_response`
-4. `chatgpt_web.release_chat`
+- `ready` — чат готов принимать новый запрос;
+- `sending` — prompt еще отправляется в UI;
+- `waiting_response` — prompt уже принят ChatGPT, идет генерация;
+- `released` — live-сессия закрыта, но история сохранена.
 
 ## Параллельные чаты
 
-`ask` и `ask_async` используют один и тот же scheduler отправки в расширении. Их смешивание между чатами подчиняется настройке `Parallel Chats`.
+Расширение управляет отправкой prompt-ов между разными чатами через настройку `Parallel Chats`.
 
 Режимы:
 
@@ -234,7 +278,7 @@
 - `Sequential` — следующий чат отправляется только после подтвержденной отправки предыдущего prompt;
 - `Sequential + safe timeout` — как `Sequential`, но перед следующим чатом добавляется случайная пауза `3-10 секунд`.
 
-Ограничение действует только между разными чатами. Второй запрос в тот же чат сервер все равно отклонит, пока не завершен предыдущий цикл `ask` или `ask_async` + `await_response`.
+Ограничение действует только между разными чатами. Внутри одного чата второй `ask_async` будет отклонен, пока предыдущее сообщение находится в `sending` или `pending`.
 
 ## Типовые ошибки
 
@@ -242,8 +286,8 @@
 
 Причина:
 
-- по чату уже есть незавершенный запрос;
-- ответ еще не был считан через `await_response`.
+- в чате уже есть активное сообщение;
+- чат еще не вернулся в `ready`.
 
 ### Запрос в чат, который еще не готов
 
@@ -251,15 +295,20 @@
 
 - чат находится в состоянии `starting`.
 
-Практически это означает, что `new_chat` уже начал создавать вкладку, но чат еще не дошел до `ready`.
-
-### `await_response` возвращает ошибку
+### `await_response` возвращает `failed`
 
 Причина:
 
-- по чату еще ничего не отправлялось;
-- ответ уже был считан ранее;
-- браузерный agent потерял соединение или ChatGPT не завершил генерацию успешно.
+- сообщение завершилось ошибкой;
+- remote server или browser-agent потеряли активную сессию;
+- сервер перезапустился до захвата ответа и перевел незавершенное сообщение в terminal `failed`.
+
+### `await_response` возвращает `pending`
+
+Причина:
+
+- запрос еще выполняется;
+- имеет смысл сделать `chatgpt_web.wait`, а затем повторить `await_response`.
 
 ## Node.js пример
 
@@ -285,27 +334,42 @@ await client.connect(transport);
 
 const newChat = await client.callTool({
   name: "chatgpt_web.new_chat",
-  arguments: { count: 2, temporary: false }
+  arguments: {}
 });
 
-const firstChat = newChat.structuredContent.chats[0];
+const chat = newChat.structuredContent.chat;
 
-await client.callTool({
+const queued = await client.callTool({
   name: "chatgpt_web.ask_async",
   arguments: {
-    chat: firstChat,
+    chat,
     request: "Сделай краткое summary."
   }
 });
 
-const response = await client.callTool({
-  name: "chatgpt_web.await_response",
-  arguments: {
-    chat: firstChat
-  }
-});
+const message = queued.structuredContent.message;
 
-console.log(response.structuredContent.response);
+while (true) {
+  const response = await client.callTool({
+    name: "chatgpt_web.await_response",
+    arguments: { chat, message }
+  });
+
+  const result = response.structuredContent;
+  if (result.status === "completed") {
+    console.log(result.response);
+    break;
+  }
+
+  if (result.status === "failed") {
+    throw new Error(result.detail);
+  }
+
+  await client.callTool({
+    name: "chatgpt_web.wait",
+    arguments: { seconds: 5 }
+  });
+}
 ```
 
 Если нужна установка и подключение, вернитесь к [INSTALL.md](./INSTALL.md). Если нужен общий обзор приложения, используйте [README](../README.md).

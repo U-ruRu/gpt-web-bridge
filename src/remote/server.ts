@@ -11,6 +11,8 @@ interface RemoteServerOptions {
     host: string;
     port: number;
     serverAccessToken: string;
+    dataRootDir?: string;
+    fullLog?: boolean;
 }
 
 interface RemoteServerHandle {
@@ -26,20 +28,32 @@ interface McpSessionHandle {
     isDisposed: boolean;
 }
 
+interface RemoteServerLogger {
+    info(scope: string, message: string, details?: Record<string, unknown>): void;
+    debug(scope: string, message: string, details?: Record<string, unknown>): void;
+}
+
 const USER_TOKEN_HEADER = "x-chatgpt-web-bridge-user-token";
 
 export function startRemoteServer(options: RemoteServerOptions): RemoteServerHandle {
+    const logger = createRemoteServerLogger(Boolean(options.fullLog));
     const orchestrator = new RemoteOrchestrator({
-        serverAccessToken: options.serverAccessToken
+        serverAccessToken: options.serverAccessToken,
+        dataRootDir: options.dataRootDir,
+        logger: {
+            debug(message, details) {
+                logger.debug("orchestrator", message, details);
+            }
+        }
     });
     const mcpSessions = new Map<string, McpSessionHandle>();
     const websocketServer = new WebSocketServer({ noServer: true });
 
     const server = createServer(async (request, response) => {
         try {
-            await routeRemoteRequest(orchestrator, mcpSessions, request, response);
+            await routeRemoteRequest(orchestrator, mcpSessions, request, response, logger);
         } catch (error) {
-            handleHttpError(response, request, error);
+            handleHttpError(response, request, error, logger);
         }
     });
 
@@ -57,11 +71,11 @@ export function startRemoteServer(options: RemoteServerOptions): RemoteServerHan
             return;
         }
 
-        logServerEvent("agent", "WebSocket upgrade request received.", {
+        logger.info("agent", "WebSocket upgrade request received.", {
             remoteAddress: request.socket.remoteAddress || null
         });
         websocketServer.handleUpgrade(request, socket, head, (websocket) => {
-            wireAgentSocket(orchestrator, websocket, request.socket.remoteAddress || null);
+            wireAgentSocket(orchestrator, websocket, request.socket.remoteAddress || null, logger);
         });
     });
 
@@ -89,7 +103,7 @@ export function startRemoteServer(options: RemoteServerOptions): RemoteServerHan
                         resolve();
                     });
                 }),
-                ...[...mcpSessions.values()].map((session) => disposeMcpSession(orchestrator, mcpSessions, session, true))
+                ...[...mcpSessions.values()].map((session) => disposeMcpSession(orchestrator, mcpSessions, session, true, logger))
             ]);
         }
     };
@@ -120,10 +134,16 @@ async function routeRemoteRequest(
     orchestrator: RemoteOrchestrator,
     mcpSessions: Map<string, McpSessionHandle>,
     request: IncomingMessage,
-    response: ServerResponse
+    response: ServerResponse,
+    logger: RemoteServerLogger
 ) {
     addCorsHeaders(response);
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
+    logger.debug("http", "Incoming request.", {
+        method: request.method || "UNKNOWN",
+        path: url.pathname,
+        hasSessionId: Boolean(readSessionIdHeader(request))
+    });
 
     if (request.method === "OPTIONS") {
         response.writeHead(204);
@@ -159,13 +179,13 @@ async function routeRemoteRequest(
 
         handle = await createMcpSessionHandle(orchestrator, userId);
         mcpSessions.set(handle.sessionId, handle);
-        logServerEvent("mcp", "Created MCP transport session.", {
+        logger.info("mcp", "Created MCP transport session.", {
             sessionId: handle.sessionId,
             userId: maskIdentifier(userId)
         });
         const createdHandle = handle;
         createdHandle.transport.onclose = () => {
-            void disposeMcpSession(orchestrator, mcpSessions, createdHandle, false);
+            void disposeMcpSession(orchestrator, mcpSessions, createdHandle, false, logger);
         };
     }
 
@@ -197,7 +217,8 @@ async function disposeMcpSession(
     orchestrator: RemoteOrchestrator,
     mcpSessions: Map<string, McpSessionHandle>,
     session: McpSessionHandle,
-    closeServer: boolean
+    closeServer: boolean,
+    logger?: RemoteServerLogger
 ) {
     if (session.isDisposed) {
         return;
@@ -206,7 +227,7 @@ async function disposeMcpSession(
     session.isDisposed = true;
     mcpSessions.delete(session.sessionId);
     orchestrator.closeMcpBinding(session.sessionId);
-    logServerEvent("mcp", "Disposed MCP transport session.", {
+    logger?.info("mcp", "Disposed MCP transport session.", {
         sessionId: session.sessionId,
         userId: maskIdentifier(session.userId),
         closeServer
@@ -219,7 +240,12 @@ async function disposeMcpSession(
     await session.server.close();
 }
 
-function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket, remoteAddress: string | null) {
+function wireAgentSocket(
+    orchestrator: RemoteOrchestrator,
+    websocket: WebSocket,
+    remoteAddress: string | null,
+    logger: RemoteServerLogger
+) {
     let userId: string | null = null;
     let agentId: string | null = null;
     let ready = false;
@@ -241,7 +267,7 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket,
             const message = JSON.parse(payload.toString("utf8")) as AgentToServerMessage;
             if (!ready) {
                 if (message.type !== "agent.hello") {
-                    logServerEvent("agent", "Rejected agent socket because the first message was not agent.hello.", {
+                    logger.info("agent", "Rejected agent socket because the first message was not agent.hello.", {
                         remoteAddress
                     });
                     forceClose(4000, "The first WebSocket message must be agent.hello.");
@@ -263,7 +289,7 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket,
                 userId = registration.userId;
                 agentId = registration.agentId;
                 ready = true;
-                logServerEvent("agent", "Browser agent is ready.", {
+                logger.info("agent", "Browser agent is ready.", {
                     agentId: registration.agentId,
                     userId: maskIdentifier(registration.userId),
                     browserName: message.browserName || null,
@@ -283,10 +309,36 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket,
                 return;
             }
 
+            if (message.type === "agent.log") {
+                const logDetails = {
+                    userId: maskIdentifier(userId),
+                    agentId,
+                    source: typeof message.context?.source === "string" ? message.context.source : null,
+                    context: message.context || {}
+                };
+                if (message.level === "warn" || message.level === "error") {
+                    logger.info("agent.log", message.message, {
+                        level: message.level,
+                        ...logDetails
+                    });
+                } else {
+                    logger.debug("agent.log", message.message, {
+                        level: message.level,
+                        ...logDetails
+                    });
+                }
+            } else {
+                logger.debug("agent", "Received agent message.", {
+                    type: message.type,
+                    userId: userId ? maskIdentifier(userId) : null,
+                    agentId
+                });
+            }
+
             orchestrator.handleAgentMessage(userId, message);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            logServerEvent("agent", "Failed to process an agent WebSocket message.", {
+            logger.info("agent", "Failed to process an agent WebSocket message.", {
                 error: message,
                 remoteAddress,
                 userId: userId ? maskIdentifier(userId) : null,
@@ -303,7 +355,7 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket,
         if (ready && userId && agentId) {
             orchestrator.disconnectAgent(userId, agentId);
         }
-        logServerEvent("agent", "Browser agent socket closed.", {
+        logger.info("agent", "Browser agent socket closed.", {
             agentId,
             userId: userId ? maskIdentifier(userId) : null,
             remoteAddress
@@ -314,7 +366,7 @@ function wireAgentSocket(orchestrator: RemoteOrchestrator, websocket: WebSocket,
         if (ready && userId && agentId) {
             orchestrator.disconnectAgent(userId, agentId);
         }
-        logServerEvent("agent", "Browser agent socket failed.", {
+        logger.info("agent", "Browser agent socket failed.", {
             agentId,
             userId: userId ? maskIdentifier(userId) : null,
             remoteAddress,
@@ -354,10 +406,10 @@ function readSessionIdHeader(request: IncomingMessage) {
     return sessionId || null;
 }
 
-function handleHttpError(response: ServerResponse, request: IncomingMessage, error: unknown) {
+function handleHttpError(response: ServerResponse, request: IncomingMessage, error: unknown, logger: RemoteServerLogger) {
     const requestPath = request.url || "/";
     if (error instanceof HttpError) {
-        logServerEvent("http", "Request failed with an HTTP error.", {
+        logger.info("http", "Request failed with an HTTP error.", {
             method: request.method || "UNKNOWN",
             path: requestPath,
             statusCode: error.statusCode,
@@ -371,7 +423,7 @@ function handleHttpError(response: ServerResponse, request: IncomingMessage, err
         return;
     }
 
-    logServerEvent("http", "Request failed with an unexpected error.", {
+    logger.info("http", "Request failed with an unexpected error.", {
         method: request.method || "UNKNOWN",
         path: requestPath,
         error: error instanceof Error ? error.message : String(error)
@@ -398,6 +450,21 @@ function addCorsHeaders(response: ServerResponse) {
 function logServerEvent(scope: string, message: string, details?: Record<string, unknown>) {
     const suffix = details ? ` ${JSON.stringify(details)}` : "";
     console.error(`[${scope}] ${message}${suffix}`);
+}
+
+function createRemoteServerLogger(fullLog: boolean): RemoteServerLogger {
+    return {
+        info(scope, message, details) {
+            logServerEvent(scope, message, details);
+        },
+        debug(scope, message, details) {
+            if (!fullLog) {
+                return;
+            }
+
+            logServerEvent(scope, message, details);
+        }
+    };
 }
 
 function maskIdentifier(value: string) {

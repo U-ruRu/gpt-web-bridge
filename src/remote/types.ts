@@ -1,7 +1,8 @@
 import type { ChatMode } from "../bridge/types.js";
+import type { PersistedMessageStatus } from "../message-store.js";
 
 export type AgentConnectionStatus = "connecting" | "ready" | "closed";
-export type RemoteSessionState = "starting" | "ready" | "sending" | "waiting_response";
+export type RemoteSessionState = "starting" | "ready" | "sending" | "waiting_response" | "released";
 
 export interface McpBindingRecord {
     mcpSessionId: string;
@@ -11,12 +12,10 @@ export interface McpBindingRecord {
     updatedAt: string;
 }
 
-export interface RemotePendingOutcome {
-    status: "completed" | "failed";
-    response: string | null;
-    detail: string | null;
-    conversationUrl: string | null;
-    mode: ChatMode;
+export interface RemoteActiveMessageRecord {
+    message: number;
+    commandId: string;
+    createdAt: string;
 }
 
 export interface RemoteSessionRecord {
@@ -30,8 +29,7 @@ export interface RemoteSessionRecord {
     tabId: number | null;
     createdAt: string;
     updatedAt: string;
-    activeCommandId: string | null;
-    pendingOutcome: RemotePendingOutcome | null;
+    activeMessage: RemoteActiveMessageRecord | null;
 }
 
 export interface AgentHelloMessage {
@@ -41,6 +39,7 @@ export interface AgentHelloMessage {
     agentId?: string;
     browserName?: string;
     browserVersion?: string;
+    temporaryModeDelaySeconds?: number;
 }
 
 export interface AgentReadyMessage {
@@ -174,6 +173,7 @@ export interface ConnectedAgentRecord {
     userId: string;
     browserName: string | null;
     browserVersion: string | null;
+    temporaryModeDelaySeconds: number;
     status: AgentConnectionStatus;
     connectedAt: string;
     updatedAt: string;
@@ -188,27 +188,62 @@ export interface RemoteNewChatResult {
 
 export interface RemoteAskAsyncResult {
     chat: number;
+    message: number;
+    etaMinMs: number;
+    etaMaxMs: number;
 }
 
-export interface RemoteAskResult {
-    response: string;
+export interface RemoteAwaitResponsePendingResult {
+    status: "pending";
+    chat: number;
+    message: number;
+    elapsedMs: number;
 }
 
-export interface RemoteAwaitResponseResult {
+export interface RemoteAwaitResponseCompletedResult {
+    status: "completed";
+    chat: number;
+    message: number;
     response: string;
+    read: boolean;
 }
+
+export interface RemoteAwaitResponseFailedResult {
+    status: "failed";
+    chat: number;
+    message: number;
+    detail: string;
+    elapsedMs: number;
+}
+
+export type RemoteAwaitResponseResult =
+    | RemoteAwaitResponsePendingResult
+    | RemoteAwaitResponseCompletedResult
+    | RemoteAwaitResponseFailedResult;
 
 export interface RemoteReleaseResult {
     ok: true;
 }
 
-export interface RemoteSessionSummary {
+export interface RemoteMessageSummary {
+    message: number;
+    status: PersistedMessageStatus;
+    read: boolean;
+    createdAt: string;
+    completedAt: string | null;
+    elapsedMs: number;
+    generationMs: number | null;
+}
+
+export interface RemoteChatStatus {
     chat: number;
     state: RemoteSessionState;
     temporary: boolean;
+    messages: RemoteMessageSummary[];
 }
 
-export interface RemoteSessionInfoResult {
+export interface RemoteResponseStatusResult {
     defaultChat: number | null;
-    chats: RemoteSessionSummary[];
+    averageGenerationMs: number | null;
+    chats: RemoteChatStatus[];
 }

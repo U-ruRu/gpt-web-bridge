@@ -3,7 +3,7 @@
 [Вернуться к README](../README.md)  
 [Перейти к инструкции по использованию](./USAGE.md)
 
-Этот документ отвечает только за установку и подключение: сборку проекта, запуск сервера, загрузку расширения, настройку browser-agent и подключение MCP-клиента.
+Этот документ отвечает за установку и подключение: сборку проекта, запуск сервера, загрузку расширения, настройку browser-agent и подключение MCP-клиента.
 
 ## Требования
 
@@ -46,6 +46,12 @@ npm test
 
 ```powershell
 npm run start:server -- --host=127.0.0.1 --port=8787 --server-access-token=replace-me
+```
+
+Если нужен подробный терминальный лог по MCP/agent/chat lifecycle:
+
+```powershell
+npm run start:server -- --host=127.0.0.1 --port=8787 --server-access-token=replace-me --full-log
 ```
 
 Эквивалент напрямую:
@@ -113,6 +119,8 @@ npm run run:waterfox-dev
 - `Server Access Token`
 - `User Token`
 - `Parallel Chats`
+- `Typing Speed Multiplier`
+- `Temporary Mode Delay (seconds)`
 
 Для локальной схемы значения обычно такие:
 
@@ -126,7 +134,11 @@ npm run run:waterfox-dev
 - `Sequential` — следующий чат отправляется только после отправки предыдущего prompt;
 - `Sequential + safe timeout` — как `Sequential`, но с дополнительной случайной задержкой `3-10 секунд`.
 
-Значение по умолчанию: `Sequential + safe timeout`.
+`Temporary Mode Delay (seconds)`:
+
+- определяет паузу перед включением `temporary` после открытия нового чата;
+- хранится в настройках расширения и уходит на сервер в `agent.hello`;
+- значение по умолчанию: `5`.
 
 После сохранения в статусе расширения должно появиться состояние `ready`.
 
@@ -194,14 +206,16 @@ npm run run:waterfox-dev
 1. Перезапустите MCP-клиент или обновите список серверов
 2. Убедитесь, что клиент видит инструменты:
    - `chatgpt_web.new_chat`
-   - `chatgpt_web.ask`
    - `chatgpt_web.ask_async`
    - `chatgpt_web.await_response`
+   - `chatgpt_web.response_status`
+   - `chatgpt_web.wait`
    - `chatgpt_web.release_chat`
-   - `chatgpt_web.session_info`
 3. Вызовите `chatgpt_web.new_chat`
 4. Убедитесь, что браузер открыл новую вкладку `chatgpt.com`
-5. Вызовите `chatgpt_web.ask` с простым тестовым запросом
+5. Вызовите `chatgpt_web.ask_async` с простым тестовым запросом
+6. Если результат еще не готов, вызовите `chatgpt_web.wait`
+7. Заберите финальный ответ через `chatgpt_web.await_response`
 
 Минимальный тестовый запрос:
 
@@ -216,8 +230,9 @@ npm run run:waterfox-dev
 - расширение остается в статусе `ready`;
 - сервер не возвращает `401` или `503`;
 - `new_chat` отрабатывает успешно;
-- `ask` возвращает текст ответа.
+- `ask_async` возвращает `chat` и `message`;
+- `await_response` в итоге возвращает `status: "completed"` и `response`.
 
 ## После установки
 
-Следующий шаг — рабочее использование tool'ов, чатов и статусов. Это описано в [USAGE.md](./USAGE.md).
+Следующий шаг — рабочее использование tool-ов, чатов, статусов и polling-сценария. Это описано в [USAGE.md](./USAGE.md).
