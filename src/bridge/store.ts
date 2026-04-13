@@ -33,7 +33,7 @@ import { PersistentMessageStore, type PersistedMessageRecord } from "../message-
 const DEFAULT_JOB_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_LAUNCH_WAIT_TIMEOUT_MS = 30000;
 const SESSION_LOG_FILE_SUFFIX = "-runtime.log";
-const STDIO_CHAT_NUMBER = 1;
+const BRIDGE_CHAT_NUMBER = 1;
 const DEFAULT_ETA_MIN_MS = 120000;
 const DEFAULT_ETA_MAX_MS = 300000;
 
@@ -91,7 +91,7 @@ export class ChatGptWebRuntime {
         this.sessionIdValue = sessionId;
         this.paths = resolveRuntimePaths(options.dataRootDir);
         this.logger = options.logger ?? defaultLogger;
-        this.messageStore = new PersistentMessageStore(this.paths.dataRootDir, "stdio");
+        this.messageStore = new PersistentMessageStore(this.paths.dataRootDir, "bridge");
         const createdAt = now();
         this.session = {
             sessionId,
@@ -119,7 +119,7 @@ export class ChatGptWebRuntime {
         await this.messageStore.initialize({
             failInFlightDetail: "The local bridge restarted before the response was captured."
         });
-        await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+        await this.messageStore.ensureChat(this.sessionIdValue, BRIDGE_CHAT_NUMBER, {
             temporary: this.session.mode === "temporary"
         });
         await this.writeLog("info", "runtime", "Runtime initialized.", {
@@ -250,7 +250,7 @@ export class ChatGptWebRuntime {
             waitTimeoutMs
         });
         const resolvedJob = await this.waitForJobResolution(job.id, waitTimeoutMs);
-        const resolvedMessage = await this.messageStore.getMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, message.message);
+        const resolvedMessage = await this.messageStore.getMessage(this.sessionIdValue, BRIDGE_CHAT_NUMBER, message.message);
         return {
             responseText: resolvedMessage?.responseText || resolvedJob.responseText || "",
             conversationUrl: resolvedJob.conversationUrl,
@@ -267,7 +267,7 @@ export class ChatGptWebRuntime {
         const { message } = await this.createPromptJob(request);
         const { etaMinMs, etaMaxMs } = await this.getEtaRange();
         return {
-            chat: STDIO_CHAT_NUMBER,
+            chat: BRIDGE_CHAT_NUMBER,
             message: message.message,
             etaMinMs,
             etaMaxMs
@@ -276,10 +276,10 @@ export class ChatGptWebRuntime {
 
     async awaitResponse(messageNumber: number, requestedChat?: number | null): Promise<AwaitResponseResult> {
         this.assertSupportedChat(requestedChat);
-        const message = await this.messageStore.getMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, messageNumber);
+        const message = await this.messageStore.getMessage(this.sessionIdValue, BRIDGE_CHAT_NUMBER, messageNumber);
         if (!message) {
             throw new HttpError(404, "The requested message does not exist.", {
-                chat: STDIO_CHAT_NUMBER,
+                chat: BRIDGE_CHAT_NUMBER,
                 message: messageNumber
             });
         }
@@ -287,7 +287,7 @@ export class ChatGptWebRuntime {
         if (message.status === "sending" || message.status === "pending") {
             return {
                 status: "pending",
-                chat: STDIO_CHAT_NUMBER,
+                chat: BRIDGE_CHAT_NUMBER,
                 message: messageNumber,
                 elapsedMs: computeElapsedMs(message)
             };
@@ -296,17 +296,17 @@ export class ChatGptWebRuntime {
         if (message.status === "failed") {
             return {
                 status: "failed",
-                chat: STDIO_CHAT_NUMBER,
+                chat: BRIDGE_CHAT_NUMBER,
                 message: messageNumber,
                 detail: message.detail || "The prompt execution failed.",
                 elapsedMs: computeElapsedMs(message)
             };
         }
 
-        const readMessage = await this.messageStore.markMessageRead(this.sessionIdValue, STDIO_CHAT_NUMBER, messageNumber);
+        const readMessage = await this.messageStore.markMessageRead(this.sessionIdValue, BRIDGE_CHAT_NUMBER, messageNumber);
         return {
             status: "completed",
-            chat: STDIO_CHAT_NUMBER,
+            chat: BRIDGE_CHAT_NUMBER,
             message: messageNumber,
             response: readMessage.responseText || "",
             read: readMessage.read
@@ -314,16 +314,16 @@ export class ChatGptWebRuntime {
     }
 
     async getResponseStatus(): Promise<ResponseStatusResult> {
-        const chat = await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+        const chat = await this.messageStore.ensureChat(this.sessionIdValue, BRIDGE_CHAT_NUMBER, {
             temporary: this.session.mode === "temporary"
         });
         const stats = await this.messageStore.getDurationStats(this.sessionIdValue);
         return {
-            defaultChat: STDIO_CHAT_NUMBER,
+            defaultChat: BRIDGE_CHAT_NUMBER,
             averageGenerationMs: stats.averageGenerationMs,
             chats: [
                 {
-                    chat: STDIO_CHAT_NUMBER,
+                    chat: BRIDGE_CHAT_NUMBER,
                     state: this.getCurrentChatState(chat.messages),
                     temporary: this.session.mode === "temporary",
                     messages: chat.messages.map((message) => toMessageStatusSummary(message))
@@ -437,7 +437,7 @@ export class ChatGptWebRuntime {
         if (command.type === "set-temporary" && status === "completed") {
             this.session.mode = "temporary";
             this.session.updatedAt = command.updatedAt;
-            await this.messageStore.setChatTemporary(this.sessionIdValue, STDIO_CHAT_NUMBER, true);
+            await this.messageStore.setChatTemporary(this.sessionIdValue, BRIDGE_CHAT_NUMBER, true);
             await this.persistSessionState();
         }
 
@@ -482,18 +482,18 @@ export class ChatGptWebRuntime {
 
     private async createPromptJob(text: string) {
         const normalizedText = normalizeText(text);
-        const chat = await this.messageStore.ensureChat(this.sessionIdValue, STDIO_CHAT_NUMBER, {
+        const chat = await this.messageStore.ensureChat(this.sessionIdValue, BRIDGE_CHAT_NUMBER, {
             temporary: this.session.mode === "temporary"
         });
         const activeMessage = chat.messages.find((message) => message.status === "sending" || message.status === "pending");
         if (activeMessage) {
             throw new HttpError(409, "The current chat already has an active request.", {
-                chat: STDIO_CHAT_NUMBER,
+                chat: BRIDGE_CHAT_NUMBER,
                 message: activeMessage.message
             });
         }
 
-        const message = await this.messageStore.createMessage(this.sessionIdValue, STDIO_CHAT_NUMBER, normalizedText);
+        const message = await this.messageStore.createMessage(this.sessionIdValue, BRIDGE_CHAT_NUMBER, normalizedText);
         const createdAt = now();
         const job: JobRecord = {
             id: randomUUID(),
@@ -506,7 +506,7 @@ export class ChatGptWebRuntime {
             createdAt,
             updatedAt: createdAt,
             claimedAt: null,
-            chat: STDIO_CHAT_NUMBER,
+            chat: BRIDGE_CHAT_NUMBER,
             message: message.message
         };
 
@@ -566,7 +566,7 @@ export class ChatGptWebRuntime {
             job.claimedAt = job.claimedAt ?? job.updatedAt;
             job.detail = patch.detail?.trim() || "Automation started processing the job.";
             if (job.message != null) {
-                await this.messageStore.markMessageAccepted(this.sessionIdValue, STDIO_CHAT_NUMBER, job.message);
+                await this.messageStore.markMessageAccepted(this.sessionIdValue, BRIDGE_CHAT_NUMBER, job.message);
             }
         }
 
@@ -595,7 +595,7 @@ export class ChatGptWebRuntime {
             if (job.message != null) {
                 await this.messageStore.completeMessage(
                     this.sessionIdValue,
-                    STDIO_CHAT_NUMBER,
+                    BRIDGE_CHAT_NUMBER,
                     job.message,
                     job.responseText || "",
                     job.detail
@@ -608,7 +608,7 @@ export class ChatGptWebRuntime {
         if (patch.status === "failed" && job.message != null) {
             await this.messageStore.failMessage(
                 this.sessionIdValue,
-                STDIO_CHAT_NUMBER,
+                BRIDGE_CHAT_NUMBER,
                 job.message,
                 job.detail || "Unknown automation error."
             );
@@ -790,7 +790,7 @@ export class ChatGptWebRuntime {
     }
 
     private assertSupportedChat(requestedChat?: number | null) {
-        if (requestedChat == null || requestedChat === STDIO_CHAT_NUMBER) {
+        if (requestedChat == null || requestedChat === BRIDGE_CHAT_NUMBER) {
             return;
         }
 
@@ -980,7 +980,7 @@ export class ChatGptWebRuntime {
         this.session.mode = "normal";
         this.session.updatedAt = now();
         this.pendingHistory.length = 0;
-        void this.messageStore.setChatTemporary(this.sessionIdValue, STDIO_CHAT_NUMBER, false);
+        void this.messageStore.setChatTemporary(this.sessionIdValue, BRIDGE_CHAT_NUMBER, false);
     }
 
     private assertSessionId(sessionId: string) {

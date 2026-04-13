@@ -46,6 +46,7 @@ interface PendingCommand<T> {
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120000;
 const DEFAULT_TEMPORARY_MODE_DELAY_SECONDS = 5;
+const RESPONSE_STATUS_LOOKBACK_MS = 60 * 60 * 1000;
 const RESTART_FAILURE_DETAIL = "Remote server restarted before the response was captured.";
 const now = () => new Date().toISOString();
 
@@ -344,9 +345,13 @@ export class RemoteOrchestrator {
         };
     }
 
-    async getResponseStatus(userId: string, mcpSessionId: string): Promise<RemoteResponseStatusResult> {
+    async getResponseStatus(
+        userId: string,
+        mcpSessionId: string,
+        requestedChats?: number[] | null
+    ): Promise<RemoteResponseStatusResult> {
         const binding = this.ensureMcpBinding(mcpSessionId, userId);
-        const chats = await this.store.listChats(userId);
+        const chats = this.filterResponseStatusChats(await this.store.listChats(userId), requestedChats);
         const stats = await this.store.getDurationStats();
         return {
             defaultChat: binding.defaultChat,
@@ -522,6 +527,19 @@ export class RemoteOrchestrator {
         }
 
         return [this.resolveChatNumber(userId, mcpSessionId, requestedChat)];
+    }
+
+    private filterResponseStatusChats(chats: PersistedChatRecord[], requestedChats?: number[] | null) {
+        if (requestedChats?.length) {
+            const requestedChatSet = new Set(requestedChats);
+            return chats.filter((chat) => requestedChatSet.has(chat.chat));
+        }
+
+        const cutoffMs = Date.now() - RESPONSE_STATUS_LOOKBACK_MS;
+        return chats.filter((chat) => {
+            const createdAtMs = Date.parse(chat.createdAt);
+            return Number.isFinite(createdAtMs) && createdAtMs >= cutoffMs;
+        });
     }
 
     private toChatStatus(userId: string, chat: PersistedChatRecord): RemoteChatStatus {

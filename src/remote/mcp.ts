@@ -88,10 +88,13 @@ export function createRemoteMcpServer(orchestrator: RemoteOrchestrator, context:
     server.registerTool(
         "chatgpt_web.response_status",
         {
-            description: "Return the status of all retained chats and messages for the current user."
+            description: "Return recent chat/message statuses for the current user, or inspect specific chats by number.",
+            inputSchema: {
+                chats: chatListSchema.describe("Optional list of specific chat numbers to inspect, including older chats.")
+            }
         },
-        async () => {
-            const result = await orchestrator.getResponseStatus(context.userId, context.mcpSessionId);
+        async ({ chats }) => {
+            const result = await orchestrator.getResponseStatus(context.userId, context.mcpSessionId, chats);
             return {
                 content: [
                     {

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,6 +17,19 @@ const USER_TOKEN_HEADER = "x-chatgpt-web-bridge-user-token";
 function extractServerBaseUrl(stderrText) {
     const match = stderrText.match(/\[server\] Listening on (http:\/\/127\.0\.0\.1:\d+)/);
     return match?.[1] || null;
+}
+
+function getRemoteChatPath(dataRootDir, userToken, chatNumber) {
+    const userId = createHash("sha256").update(userToken).digest("hex");
+    return join(dataRootDir, "remote", "message-store", "remote", "owners", userId, `chat-${chatNumber}.json`);
+}
+
+async function rewritePersistedRemoteChat(dataRootDir, userToken, chatNumber, transform) {
+    const chatPath = getRemoteChatPath(dataRootDir, userToken, chatNumber);
+    const raw = await readFile(chatPath, "utf8");
+    const chat = JSON.parse(raw);
+    const nextChat = transform(chat);
+    await writeFile(chatPath, `${JSON.stringify(nextChat, null, 2)}\n`, "utf8");
 }
 
 function createAgentClient(baseUrl, serverAccessToken, userToken, options = {}) {
@@ -437,6 +452,55 @@ test("remote server can open and release multiple chats without reusing chat num
             }
         });
         assert.deepEqual(nextChat.structuredContent, { chat: 4 });
+    }, {
+        agentOptions: {
+            temporaryModeDelaySeconds: 0
+        }
+    });
+});
+
+test("response_status shows only chats from the last hour unless specific chats are requested", { timeout: 30000 }, async (t) => {
+    await withRemoteServer(t, async ({ dataRootDir, first, userToken }) => {
+        await first.client.callTool({
+            name: "chatgpt_web.new_chat",
+            arguments: {
+                count: 2,
+                temporary: false
+            }
+        });
+
+        const oldTimestamp = new Date(Date.now() - (2 * 60 * 60 * 1000)).toISOString();
+        await rewritePersistedRemoteChat(dataRootDir, userToken, 1, (chat) => ({
+            ...chat,
+            createdAt: oldTimestamp,
+            updatedAt: oldTimestamp
+        }));
+
+        const recentOnlyStatus = await first.client.callTool({
+            name: "chatgpt_web.response_status",
+            arguments: {}
+        });
+        assert.deepEqual(recentOnlyStatus.structuredContent, {
+            defaultChat: 2,
+            averageGenerationMs: null,
+            chats: [
+                { chat: 2, state: "ready", temporary: false, messages: [] }
+            ]
+        });
+
+        const specificChatStatus = await first.client.callTool({
+            name: "chatgpt_web.response_status",
+            arguments: {
+                chats: [1]
+            }
+        });
+        assert.deepEqual(specificChatStatus.structuredContent, {
+            defaultChat: 2,
+            averageGenerationMs: null,
+            chats: [
+                { chat: 1, state: "ready", temporary: false, messages: [] }
+            ]
+        });
     }, {
         agentOptions: {
             temporaryModeDelaySeconds: 0

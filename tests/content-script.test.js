@@ -149,10 +149,12 @@ async function loadAssistantMessageHelpers() {
     const normalizeAssistantMessageTextMatch = source.match(/function normalizeAssistantMessageText\(text\) \{[\s\S]*?\n    \}/);
     const getTopLevelAssistantContentNodesMatch = source.match(/function getTopLevelAssistantContentNodes\(messageNode\) \{[\s\S]*?\n    \}/);
     const extractAssistantMessageTextMatch = source.match(/function extractAssistantMessageText\(messageNode\) \{[\s\S]*?\n    \}/);
+    const selectPreferredAssistantMessageNodeMatch = source.match(/function selectPreferredAssistantMessageNode\(turnNode\) \{[\s\S]*?\n    \}/);
 
     assert.ok(normalizeAssistantMessageTextMatch, "normalizeAssistantMessageText() should be declared in content-script.js");
     assert.ok(getTopLevelAssistantContentNodesMatch, "getTopLevelAssistantContentNodes() should be declared in content-script.js");
     assert.ok(extractAssistantMessageTextMatch, "extractAssistantMessageText() should be declared in content-script.js");
+    assert.ok(selectPreferredAssistantMessageNodeMatch, "selectPreferredAssistantMessageNode() should be declared in content-script.js");
 
     class FakeElement {
         constructor({ tagName = "div", className = "", text = "", attributes = {} } = {}) {
@@ -187,14 +189,11 @@ async function loadAssistantMessageHelpers() {
         }
 
         querySelectorAll(selector) {
-            if (selector !== ".markdown, .prose") {
-                return [];
-            }
-
             const results = [];
+            const selectors = `${selector}`.split(",").map((part) => part.trim()).filter(Boolean);
             const visit = (node) => {
                 for (const child of node.children) {
-                    if (child.matchesContentSelector()) {
+                    if (selectors.some((entry) => child.matchesSelector(entry))) {
                         results.push(child);
                     }
                     visit(child);
@@ -205,9 +204,60 @@ async function loadAssistantMessageHelpers() {
             return results;
         }
 
-        matchesContentSelector() {
+        querySelector(selector) {
+            return this.querySelectorAll(selector)[0] || null;
+        }
+
+        closest(selector) {
+            let current = this;
+            while (current) {
+                if (current.matchesSelector(selector)) {
+                    return current;
+                }
+                current = current.parentElement;
+            }
+
+            return null;
+        }
+
+        matchesSelector(selector) {
+            const normalizedSelector = `${selector}`.trim();
+            if (!normalizedSelector) {
+                return false;
+            }
+
+            if (normalizedSelector.includes(" ")) {
+                const [ancestorSelector, descendantSelector] = normalizedSelector.split(/\s+/, 2);
+                return this.matchesSelector(descendantSelector) && Boolean(this.closest(ancestorSelector));
+            }
+
             const classes = new Set(`${this.className || ""}`.split(/\s+/).filter(Boolean));
-            return classes.has("markdown") || classes.has("prose");
+            if (normalizedSelector === ".markdown") {
+                return classes.has("markdown");
+            }
+
+            if (normalizedSelector === ".prose") {
+                return classes.has("prose");
+            }
+
+            if (normalizedSelector === "section[data-turn='assistant']") {
+                return this.tagName === "SECTION" && this.getAttribute("data-turn") === "assistant";
+            }
+
+            if (normalizedSelector === "[data-writing-block]") {
+                return this.getAttribute("data-writing-block") !== null;
+            }
+
+            if (normalizedSelector === "[data-message-author-role='assistant']") {
+                return this.getAttribute("data-message-author-role") === "assistant";
+            }
+
+            if (normalizedSelector === "[data-message-author-role='assistant'][data-turn-start-message='true']") {
+                return this.getAttribute("data-message-author-role") === "assistant" &&
+                    this.getAttribute("data-turn-start-message") === "true";
+            }
+
+            return false;
         }
     }
 
@@ -220,16 +270,110 @@ async function loadAssistantMessageHelpers() {
         ${normalizeAssistantMessageTextMatch[0]}
         ${getTopLevelAssistantContentNodesMatch[0]}
         ${extractAssistantMessageTextMatch[0]}
+        ${selectPreferredAssistantMessageNodeMatch[0]}
         module.exports = {
             normalizeAssistantMessageText,
             getTopLevelAssistantContentNodes,
-            extractAssistantMessageText
+            extractAssistantMessageText,
+            selectPreferredAssistantMessageNode
         };`
     );
     factory(module, module.exports, FakeElement);
     return {
         ...module.exports,
         FakeElement
+    };
+}
+
+async function loadAssistantResponseWaiter() {
+    const source = await readFile(join(projectDir, "extension", "content-script.js"), "utf8");
+    const shortDelayMatch = source.match(/const SHORT_DELAY_MS = (\d+);/);
+    const responseStableMatch = source.match(/const RESPONSE_STABLE_MS = (\d+);/);
+    const isNewAssistantSnapshotMatch = source.match(/function isNewAssistantSnapshot\(previousSnapshot, currentSnapshot\) \{[\s\S]*?\n    \}/);
+    const hasWritingBlockMatch = source.match(/function hasWritingBlock\(node\) \{[\s\S]*?\n    \}/);
+    const isAssistantRenderInProgressMatch = source.match(/function isAssistantRenderInProgress\(snapshot\) \{[\s\S]*?\n    \}/);
+    const waitForAssistantResponseMatch = source.match(/async function waitForAssistantResponse\(previousSnapshot, timeoutMs\) \{[\s\S]*?\n    \}/);
+
+    assert.ok(shortDelayMatch, "SHORT_DELAY_MS should be declared in content-script.js");
+    assert.ok(responseStableMatch, "RESPONSE_STABLE_MS should be declared in content-script.js");
+    assert.ok(isNewAssistantSnapshotMatch, "isNewAssistantSnapshot() should be declared in content-script.js");
+    assert.ok(hasWritingBlockMatch, "hasWritingBlock() should be declared in content-script.js");
+    assert.ok(isAssistantRenderInProgressMatch, "isAssistantRenderInProgress() should be declared in content-script.js");
+    assert.ok(waitForAssistantResponseMatch, "waitForAssistantResponse() should be declared in content-script.js");
+
+    class FakeElement {
+        constructor({ attributes = {} } = {}) {
+            this.attributes = { ...attributes };
+            this.children = [];
+            this.parentElement = null;
+        }
+
+        appendChild(child) {
+            child.parentElement = this;
+            this.children.push(child);
+            return child;
+        }
+
+        getAttribute(name) {
+            return this.attributes[name] ?? null;
+        }
+
+        querySelector(selector) {
+            if (selector !== "[data-writing-block]") {
+                return null;
+            }
+
+            return this.querySelectorAll(selector)[0] || null;
+        }
+
+        querySelectorAll(selector) {
+            if (selector !== "[data-writing-block]") {
+                return [];
+            }
+
+            const results = [];
+            const visit = (node) => {
+                for (const child of node.children) {
+                    if (child.getAttribute("data-writing-block") !== null) {
+                        results.push(child);
+                    }
+                    visit(child);
+                }
+            };
+
+            visit(this);
+            return results;
+        }
+    }
+
+    const module = { exports: {} };
+    const factory = new Function(
+        "module",
+        "exports",
+        "HTMLElement",
+        "getLatestAssistantMessageSnapshot",
+        "findGenerationStopButton",
+        "sleep",
+        `"use strict";
+        const SHORT_DELAY_MS = ${Number(shortDelayMatch[1])};
+        const RESPONSE_STABLE_MS = ${Number(responseStableMatch[1])};
+        ${isNewAssistantSnapshotMatch[0]}
+        ${hasWritingBlockMatch[0]}
+        ${isAssistantRenderInProgressMatch[0]}
+        ${waitForAssistantResponseMatch[0]}
+        module.exports = { waitForAssistantResponse };`
+    );
+
+    return function createWaiter(dependencies) {
+        factory(
+            module,
+            module.exports,
+            FakeElement,
+            dependencies.getLatestAssistantMessageSnapshot,
+            dependencies.findGenerationStopButton,
+            dependencies.sleep
+        );
+        return module.exports;
     };
 }
 
@@ -356,4 +500,65 @@ test("content script avoids duplicating nested assistant content wrappers", asyn
     assert.equal(contentNodes.length, 1);
     assert.equal(contentNodes[0], wrapper);
     assert.equal(extractAssistantMessageText(message), "Full answer\n\nNested part");
+});
+
+test("content script prefers the final turn-start assistant message over interim thinking updates", async () => {
+    const { selectPreferredAssistantMessageNode, extractAssistantMessageText, FakeElement } = await loadAssistantMessageHelpers();
+
+    const turn = new FakeElement({
+        tagName: "section",
+        attributes: {
+            "data-turn": "assistant"
+        }
+    });
+    turn.appendChild(new FakeElement({
+        attributes: {
+            "data-message-author-role": "assistant"
+        },
+        text: "Interim 1"
+    }));
+    turn.appendChild(new FakeElement({
+        attributes: {
+            "data-message-author-role": "assistant"
+        },
+        text: "Interim 2"
+    }));
+    const finalMessage = turn.appendChild(new FakeElement({
+        attributes: {
+            "data-message-author-role": "assistant",
+            "data-turn-start-message": "true"
+        }
+    }));
+    finalMessage.appendChild(new FakeElement({
+        className: "markdown",
+        text: "Final answer"
+    }));
+
+    assert.equal(selectPreferredAssistantMessageNode(turn), finalMessage);
+    assert.equal(extractAssistantMessageText(selectPreferredAssistantMessageNode(turn)), "Final answer");
+});
+
+test("content script does not return a partial assistant snapshot when the response wait times out", async () => {
+    const createWaiter = await loadAssistantResponseWaiter();
+    const partialSnapshot = {
+        key: "assistant-turn-1",
+        text: "Partial answer",
+        messageNode: null,
+        turnNode: null
+    };
+
+    const { waitForAssistantResponse } = createWaiter({
+        getLatestAssistantMessageSnapshot() {
+            return partialSnapshot;
+        },
+        findGenerationStopButton() {
+            return {};
+        },
+        sleep() {
+            return Promise.resolve();
+        }
+    });
+
+    const result = await waitForAssistantResponse(null, 5);
+    assert.equal(result, null);
 });

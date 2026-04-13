@@ -1,11 +1,9 @@
-import { randomUUID } from "node:crypto";
 import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "./bridge/types.js";
 import { ChatGptWebRuntime } from "./bridge/store.js";
-import { listenBridgeServer, openExternalUrl, startBridgeServer } from "./bridge/server.js";
-import { startStdioMcpServer } from "./mcp/server.js";
+import { listenBridgeServer, startBridgeServer } from "./bridge/server.js";
 import { listenRemoteServer, startRemoteServer } from "./remote/server.js";
 
-type TransportMode = "bridge" | "stdio" | "remote" | "server";
+type TransportMode = "bridge" | "remote" | "server";
 
 interface CliOptions {
     transport: TransportMode;
@@ -52,48 +50,15 @@ async function main() {
     const bridgeServer = startBridgeServer(runtime);
     const bridgeAddress = await listenBridgeServer(bridgeServer, {
         host: options.host,
-        port: options.transport === "stdio" ? 0 : options.port
+        port: options.port
     });
-
-    let mcpServer: Awaited<ReturnType<typeof startStdioMcpServer>> | null = null;
 
     try {
         console.error(`[bridge] Listening on ${bridgeAddress.baseUrl} for session ${runtime.sessionId}`);
-
-        if (options.transport === "stdio") {
-            await tryRestoreConversation(runtime, bridgeAddress.port);
-            mcpServer = await startStdioMcpServer(runtime, {
-                bridgePort: bridgeAddress.port
-            });
-            console.error(`[mcp] MCP stdio server is ready for session ${runtime.sessionId}`);
-            await waitForProcessExit();
-            return;
-        }
-
         console.error("[bridge] HTTP bridge mode is running.");
         await waitForProcessExit();
     } finally {
-        await Promise.allSettled([
-            mcpServer?.close(),
-            closeHttpServer(bridgeServer)
-        ]);
-    }
-}
-
-async function tryRestoreConversation(runtime: ChatGptWebRuntime, bridgePort: number) {
-    if (!runtime.hasRestorableConversation()) {
-        return;
-    }
-
-    try {
-        const restored = await runtime.restoreConversationLaunch(bridgePort, openExternalUrl);
-        if (restored) {
-            console.error(
-                `[runtime] Restored conversation ${runtime.getRestorableConversationUrl()} for session ${runtime.sessionId}`
-            );
-        }
-    } catch (error) {
-        console.error("[runtime] Failed to restore the previous conversation. Continuing with manual recovery.", error);
+        await Promise.allSettled([closeHttpServer(bridgeServer)]);
     }
 }
 
@@ -119,7 +84,7 @@ function parseCliOptions(args: string[]): CliOptions {
     const sessionId =
         options.get("session-id") ||
         process.env.CHATGPT_WEB_BRIDGE_SESSION_ID ||
-        (transport === "stdio" ? randomUUID() : "api");
+        "api";
     const dataDir = options.get("data-dir") || process.env.CHATGPT_WEB_BRIDGE_DATA_DIR || undefined;
     const serverAccessToken =
         options.get("server-access-token") ||
@@ -145,10 +110,6 @@ function parseCliOptions(args: string[]): CliOptions {
 function parseTransportMode(rawValue: string | undefined): TransportMode {
     if (!rawValue || rawValue === "bridge") {
         return "bridge";
-    }
-
-    if (rawValue === "stdio") {
-        return "stdio";
     }
 
     if (rawValue === "remote" || rawValue === "server") {

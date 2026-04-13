@@ -5,8 +5,8 @@
     const SHORT_DELAY_MS = 250;
     const DEFAULT_WAIT_MS = 12000;
     const SEND_TIMEOUT_MS = 8000;
-    const RESPONSE_TIMEOUT_MS = 180000;
-    const RESPONSE_STABLE_MS = 1800;
+    const RESPONSE_TIMEOUT_MS = 900000;
+    const RESPONSE_STABLE_MS = 3000;
     const SESSION_URL_REGEX = /^https:\/\/chatgpt\.com\/c\/[^/?#]+/;
     const TYPING_DELAY_BASE_MIN_MS = 45;
     const TYPING_DELAY_BASE_MAX_MS = 170;
@@ -599,38 +599,117 @@
 
         while (Date.now() < deadline) {
             const currentSnapshot = getLatestAssistantMessageSnapshot();
-            const generationInProgress = Boolean(findGenerationStopButton());
+            const renderInProgress = isAssistantRenderInProgress(currentSnapshot);
             const hasNewAssistantContent = isNewAssistantSnapshot(previousSnapshot, currentSnapshot);
 
             if (hasNewAssistantContent) {
                 if (!latestSnapshot || latestSnapshot.key !== currentSnapshot.key || latestSnapshot.text !== currentSnapshot.text) {
                     latestSnapshot = currentSnapshot;
                     stableSince = Date.now();
-                } else if (!generationInProgress && latestSnapshot.text && Date.now() - stableSince >= RESPONSE_STABLE_MS) {
+                } else if (!renderInProgress && latestSnapshot.text && Date.now() - stableSince >= RESPONSE_STABLE_MS) {
                     return latestSnapshot;
                 }
             }
 
-            await sleep(generationInProgress ? 400 : SHORT_DELAY_MS);
+            await sleep(renderInProgress ? 400 : SHORT_DELAY_MS);
         }
 
-        return latestSnapshot;
+        return null;
+    }
+
+    function isAssistantRenderInProgress(snapshot) {
+        if (findGenerationStopButton()) {
+            return true;
+        }
+
+        return hasWritingBlock(snapshot?.turnNode || snapshot?.messageNode || null);
+    }
+
+    function hasWritingBlock(node) {
+        if (!(node instanceof HTMLElement)) {
+            return false;
+        }
+
+        return Boolean(node.querySelector("[data-writing-block]"));
     }
 
     function getLatestAssistantMessageSnapshot() {
-        const candidates = collectAssistantMessageCandidates();
-        if (!candidates.length) {
+        const candidates = collectAssistantTurnCandidates();
+        if (candidates.length) {
+            return candidates[candidates.length - 1];
+        }
+
+        const fallbackCandidates = collectAssistantMessageCandidates();
+        if (!fallbackCandidates.length) {
             return null;
         }
 
-        return candidates[candidates.length - 1];
+        return fallbackCandidates[fallbackCandidates.length - 1];
+    }
+
+    function collectAssistantTurnCandidates() {
+        const root = document.querySelector("main") || document;
+        const turns = [];
+        const seen = new Set();
+        root.querySelectorAll("section[data-turn='assistant']").forEach((turnNode) => {
+            if (!(turnNode instanceof HTMLElement)) {
+                return;
+            }
+
+            const messageNode = selectPreferredAssistantMessageNode(turnNode);
+            if (!(messageNode instanceof HTMLElement)) {
+                return;
+            }
+
+            const text = extractAssistantMessageText(messageNode);
+            if (!text) {
+                return;
+            }
+
+            const key = turnNode.getAttribute("data-turn-id") || getElementKey(messageNode);
+            if (seen.has(key)) {
+                return;
+            }
+
+            seen.add(key);
+            turns.push({
+                key,
+                text,
+                messageNode,
+                turnNode
+            });
+        });
+
+        return turns;
+    }
+
+    function selectPreferredAssistantMessageNode(turnNode) {
+        if (!(turnNode instanceof HTMLElement)) {
+            return null;
+        }
+
+        const turnStartCandidates = Array.from(
+            turnNode.querySelectorAll("[data-message-author-role='assistant'][data-turn-start-message='true']")
+        ).filter((node) => node instanceof HTMLElement);
+        if (turnStartCandidates.length > 0) {
+            return turnStartCandidates[turnStartCandidates.length - 1];
+        }
+
+        const assistantNodes = Array.from(turnNode.querySelectorAll("[data-message-author-role='assistant']")).filter(
+            (node) => node instanceof HTMLElement
+        );
+        if (assistantNodes.length === 1) {
+            return assistantNodes[0];
+        }
+
+        return null;
     }
 
     function collectAssistantMessageCandidates() {
         const root = document.querySelector("main") || document;
         const candidates = [];
         const seen = new Set();
-        const pushCandidate = (messageNode, hostNode) => {
+        const pushCandidate = (messageNode, hostNode, turnNode = null) => {
             if (!(messageNode instanceof HTMLElement)) {
                 return;
             }
@@ -647,11 +726,16 @@
             }
 
             seen.add(key);
-            candidates.push({ key, text });
+            candidates.push({
+                key,
+                text,
+                messageNode,
+                turnNode: turnNode instanceof HTMLElement ? turnNode : null
+            });
         };
 
         root.querySelectorAll("[data-message-author-role='assistant']").forEach((node) => {
-            pushCandidate(node, node.closest("article") || node);
+            pushCandidate(node, node.closest("article") || node, node.closest("section[data-turn='assistant']"));
         });
 
         if (candidates.length === 0) {
@@ -663,7 +747,7 @@
                 }
 
                 fallbackHosts.add(hostNode);
-                pushCandidate(hostNode, hostNode);
+                pushCandidate(hostNode, hostNode, hostNode.closest("section[data-turn='assistant']"));
             });
         }
 

@@ -67,12 +67,9 @@ chatgpt.com
 npm run start:server
 ```
 
-В репозитории остаются legacy-режимы:
+Для локальной отладки browser bridge отдельно остается:
 
 - `npm run start:bridge`
-- `npm run start:mcp`
-
-Они нужны для обратной совместимости и локальной отладки.
 
 ## Будущие планы
 
